@@ -17,6 +17,31 @@ Expect:
 
 Not suitable for: production workloads, or storing data you care about.
 
+Building from source
+--------------------
+
+RMR and BRMR are out-of-tree Linux kernel modules.
+
+- Supported kernel version: v6.12. The
+  [`linux-6.12.y`](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/log/?h=linux-6.12.y)
+  stable branch is recommended.
+- Install kernel headers matching the target kernel
+  (`linux-headers-$(uname -r)` on Debian/Ubuntu).
+- The following RTRS config options must be enabled in the kernel:
+
+  ```
+  CONFIG_INFINIBAND_RTRS=m
+  CONFIG_INFINIBAND_RTRS_CLIENT=m
+  CONFIG_INFINIBAND_RTRS_SERVER=m
+  ```
+
+- Run `make` in the source-code repository root.
+- Load modules in dependency order: `rtrs-*`, then `rmr-*`, then `brmr-*`.
+  Unload in reverse order.
+
+See the User/admin guide to RMR cluster management for a full two-node
+bring-up.
+
 License
 -------
 
