@@ -55,7 +55,7 @@ struct rmr_msg_hdr {
  * @hdr:	message header
  * @id_a:	first 64bit of the object id
  * @id_b:	second 64bit of the object id
- * @offset:	offset from where to read/write
+ * @offset:	byte offset of the IO on the data area.
  * @flags:	bitmask, valid values are defined in enum rmr_io_flags
  * @length:	number of bytes for I/O read/write
  * @pool_id:	pool id to which the object belongs
@@ -65,7 +65,7 @@ struct rmr_msg_io {
 	__le64		id_a;
 	__le64		id_b;
 
-	__le32		offset;
+	__le64		offset;
 	__le32		length;
 	__le32		flags;
 	__le16          prio;
@@ -77,7 +77,7 @@ struct rmr_msg_io {
 
 	u8		member_id;
 	u8		sync;
-	u8		__padding[19]; //padding is not correct now i think
+	u8		__padding[15];
 };
 
 struct rmr_pool_member_info {
