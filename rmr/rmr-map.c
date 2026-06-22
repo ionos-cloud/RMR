@@ -340,6 +340,11 @@ inline void rmr_map_set_dirty(struct rmr_dirty_id_map *map, rmr_id_t id, u8 filt
 
 	chunk_md = rmr_get_chunk_md_from_id(map, id);
 	for (i = 0; i < id.a; i++) {
+		if (i && !((id.b + i) & (CHUNKS_PER_SLP - 1))) {
+			rmr_id_t next = { .a = 1, .b = id.b + i };
+
+			chunk_md = rmr_get_chunk_md_from_id(map, next);
+		}
 		rmr_chunk_md_set_dirty(chunk_md);
 		chunk_md++;
 	}
@@ -405,6 +410,11 @@ inline struct rmr_map_entry *rmr_map_unset_dirty(struct rmr_dirty_id_map *map, r
 	chunk_md = rmr_get_chunk_md_from_id(map, id);
 	BUG_ON(!chunk_md);
 	for (i = 0; i < id.a; i++) {
+		if (i && !((id.b + i) & (CHUNKS_PER_SLP - 1))) {
+			rmr_id_t next = { .a = 1, .b = id.b + i };
+
+			chunk_md = rmr_get_chunk_md_from_id(map, next);
+		}
 		rmr_chunk_md_unset_dirty(chunk_md);
 		chunk_md++;
 	}
