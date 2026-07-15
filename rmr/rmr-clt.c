@@ -2775,6 +2775,18 @@ struct rmr_iu *rmr_clt_get_iu(struct rmr_pool *pool, enum rmr_io_flags flag,
 		}
 	}
 
+	if (iu->num_sessions == 0) {
+		/*
+		 * No NORMAL session to carry this write/flush. Fail it here
+		 * rather than return an iu that rmr_clt_request would send to
+		 * nobody: such an iu does not complete and holds its
+		 * ids_inflight_ref, wedging both the submitter and any later IO
+		 * freeze that waits on the ref to drain.
+		 */
+		err = -ENODEV;
+		goto put_iu;
+	}
+
 	refcount_set(&iu->refcount, iu->num_sessions);
 	iu->errno = 0;
 
