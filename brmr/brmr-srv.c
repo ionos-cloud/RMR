@@ -1042,7 +1042,7 @@ put_bio:
  *     0 in case of success
  *     negative in case of failure
  */
-static int brmr_srv_process_blk_req(void *device, void *data, u32 data_offset,
+static int brmr_srv_process_blk_req(void *device, void *data, u64 data_offset,
 				    u32 length, unsigned long flags, u16 prio, void *priv)
 {
 	struct brmr_srv_blk_dev *dev = (struct brmr_srv_blk_dev *)device;
@@ -1056,7 +1056,7 @@ static int brmr_srv_process_blk_req(void *device, void *data, u32 data_offset,
 	}
 
 	if (!brmr_srv_blk_io_allowed(dev)) {
-		pr_err("Store name %s, offset %u, length %u, io is not allowed!\n",
+		pr_err("Store name %s, offset %llu, length %u, io is not allowed!\n",
 		       dev->poolname, data_offset, length);
 		ret = -EINVAL;
 		goto err;

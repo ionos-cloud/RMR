@@ -133,7 +133,7 @@ void blk_str_destroy_sysfs_files(struct brmr_srv_blk_dev *dev,
 /* brmr-server IO interface */
 
 struct brmr_srv_store_ops {
-	int (*submit_req)(void *device, void *data, u32 offset, u32 length,
+	int (*submit_req)(void *device, void *data, u64 offset, u32 length,
 			  unsigned long flags, u16 prio, void *priv);
 	int (*submit_md_req)(struct brmr_srv_blk_dev *dev, void *data, u32 offset, u32 length,
 			     unsigned long flags, void *priv);

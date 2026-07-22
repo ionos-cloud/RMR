@@ -678,8 +678,7 @@ int rmr_clt_send_map_update(struct rmr_pool *pool, struct rmr_iu *iu)
 			continue;
 		}
 
-		pr_debug("Sending request flags %u to pool %s session %s "
-			 "chunk [%llu, %llu] offset %u length %u)\n",
+		pr_debug("Sending request flags %u to pool %s session %s chunk [%llu, %llu] offset %llu length %u)\n",
 			 iu->msg.flags, pool->poolname, pool_sess->sessname,
 			 iu->msg.id_a, iu->msg.id_b,
 			 iu->msg.offset, iu->msg.length);

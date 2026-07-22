@@ -14,7 +14,7 @@ struct rmr_srv_req {
 	struct rmr_srv_pool *srv_pool;
 	rmr_id_t id;
 
-	u32 offset;
+	u64 offset;
 	u32 length;
 	u32 flags;
 	u16 prio;

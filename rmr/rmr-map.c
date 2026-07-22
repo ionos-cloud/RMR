@@ -340,6 +340,11 @@ inline void rmr_map_set_dirty(struct rmr_dirty_id_map *map, rmr_id_t id, u8 filt
 
 	chunk_md = rmr_get_chunk_md_from_id(map, id);
 	for (i = 0; i < id.a; i++) {
+		if (i && !((id.b + i) & (CHUNKS_PER_SLP - 1))) {
+			rmr_id_t next = { .a = 1, .b = id.b + i };
+
+			chunk_md = rmr_get_chunk_md_from_id(map, next);
+		}
 		rmr_chunk_md_set_dirty(chunk_md);
 		chunk_md++;
 	}
@@ -405,6 +410,11 @@ inline struct rmr_map_entry *rmr_map_unset_dirty(struct rmr_dirty_id_map *map, r
 	chunk_md = rmr_get_chunk_md_from_id(map, id);
 	BUG_ON(!chunk_md);
 	for (i = 0; i < id.a; i++) {
+		if (i && !((id.b + i) & (CHUNKS_PER_SLP - 1))) {
+			rmr_id_t next = { .a = 1, .b = id.b + i };
+
+			chunk_md = rmr_get_chunk_md_from_id(map, next);
+		}
 		rmr_chunk_md_unset_dirty(chunk_md);
 		chunk_md++;
 	}
@@ -517,22 +527,40 @@ inline void rmr_map_clear_filter_all(struct rmr_dirty_id_map *map, u8 filter)
  */
 inline void rmr_map_unset_dirty_all(struct rmr_dirty_id_map *map)
 {
-	rmr_id_t id;
-	u64 i;
+	el_flp *flp_ptr;
+	u64 no_of_slps;
+	bool is_last_flp;
+	void *slp;
+	int i, j;
+
+	map->ts = jiffies;
 
 	/*
-	 * TODO: memcpy zeroes or something faster
+	 * All chunk metadata lives in the SLP pages, so clear each SLP page in
+	 * one shot rather than walking chunk by chunk. The trailing bytes of
+	 * the last SLP track no chunks and are already zero, so memset-ing the
+	 * full page is harmless.
 	 */
+	for (i = 0; i < map->no_of_flp; i++) {
+		flp_ptr = (el_flp *)map->dirty_bitmap[i];
+		is_last_flp = (i == (map->no_of_flp - 1));
 
-	id.a = 1;
-	for (i = 0; i < map->no_of_chunks; i++) {
-		id.b = i;
+		if (is_last_flp)
+			no_of_slps = map->no_of_slp_in_last_flp;
+		else
+			no_of_slps = NO_OF_SLP_PER_FLP;
 
-		if (!rmr_map_check_dirty(map, id))
-			continue;
-
-		rmr_map_unset_dirty(map, id, MAP_NO_FILTER);
+		for (j = 0; j < no_of_slps; j++, flp_ptr++) {
+			slp = (void *)(*flp_ptr);
+			memset(slp, 0, PAGE_SIZE);
+		}
 	}
+
+	/*
+	 * Drop all id->entry mappings. This matches the per-chunk path, which
+	 * erased each entry from the xarray without freeing it.
+	 */
+	xa_destroy(&map->rmr_id_map);
 
 	rmr_map_clear_filter_all(map, MAP_ENTRY_UNSYNCED);
 }

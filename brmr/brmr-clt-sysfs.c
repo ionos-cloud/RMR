@@ -232,7 +232,8 @@ static ssize_t brmr_unmap_device_store(struct kobject *kobj,
 		return -EINVAL;
 	}
 
-	pr_info("Closing device %s.\n", dev->gd->disk_name);
+	pr_info("Closing device %s.\n",
+		dev->gd ? dev->gd->disk_name : "(no disk)");
 
 	/*
 	 * We take explicit module reference only for one reason: do not
@@ -245,7 +246,8 @@ static ssize_t brmr_unmap_device_store(struct kobject *kobj,
 	if (unlikely(err)) {
 		if (unlikely(err != -EALREADY))
 			pr_err("unmap_device %s: %d\n",
-			       dev->gd->disk_name, err);
+			       dev->gd ? dev->gd->disk_name : "(no disk)",
+			       err);
 		goto module_put;
 	}
 

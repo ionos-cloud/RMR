@@ -1122,6 +1122,8 @@ err_out:
 
 static void destroy_gen_disk(struct brmr_clt_dev *dev)
 {
+	if (!dev->gd)
+		return;
 	del_gendisk(dev->gd);
 	/*
 	 * Before marking queue as dying (blk_cleanup_queue() does that)
@@ -1131,6 +1133,7 @@ static void destroy_gen_disk(struct brmr_clt_dev *dev)
 	blk_mq_freeze_queue(dev->queue);
 	blk_mq_unfreeze_queue(dev->queue);
 	put_disk(dev->gd);
+	dev->gd = NULL;
 }
 
 /**
@@ -1141,12 +1144,24 @@ static void destroy_gen_disk(struct brmr_clt_dev *dev)
  *
  * Return:
  *	0 in case of success
- *	negative in case of failure
+ *	-EALREADY if a close is already in flight (repeat unmap while a
+ *	previous close is stuck, e.g. on a dead session) — the device is
+ *	left alone so the first close can finish
+ *	negative in case of other failure
  */
 int brmr_clt_close_device(struct brmr_clt_dev *dev,
 		      const struct attribute *sysfs_self)
 {
+	mutex_lock(&brmr_device_lock);
+	if (dev->dev_state == DEV_STATE_CLOSING) {
+		mutex_unlock(&brmr_device_lock);
+		pr_warn("%s: close already in flight, ignoring repeat unmap\n",
+			__func__);
+		return -EALREADY;
+	}
 	dev->dev_state = DEV_STATE_CLOSING;
+	mutex_unlock(&brmr_device_lock);
+
 	destroy_gen_disk(dev);
 	brmr_clt_send_unmap_cmd(dev);
 	sysfs_remove_link(&dev->kobj, BRMR_LINK_NAME);

@@ -3136,7 +3136,7 @@ int rmr_clt_request(struct rmr_pool *pool, struct rmr_iu *iu,
 	iu->msg.hdr.type = cpu_to_le16(RMR_MSG_IO);
 	iu->msg.hdr.__padding = 0;
 
-	iu->msg.offset = cpu_to_le32(offset);
+	iu->msg.offset = cpu_to_le64(offset);
 	iu->msg.length = cpu_to_le32(length);
 	iu->msg.flags = cpu_to_le32(flag);
 	iu->msg.prio = cpu_to_le16(prio);

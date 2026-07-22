@@ -178,18 +178,6 @@ static inline int rmr_pool_md_check_discard(struct rmr_pool *pool, u8 member_id)
 #define RTRS_IO_LIMIT	   102400
 //#define RTRS_IO_LIMIT 40 //for tests only
 
-/*
- * TODO:
- * We currently do not have mapped_size while creating dirty maps,
- * which means we cannot calculate no_of_chunks, hence cannot allocate bitmap
- * So, as a workaround, we allocate max size bitmap,
- * and to reduce that allocation, we cap max mapped_size.
- *
- * 1GB max mapped size for now.
- * (Size mentioned in number of sectors, just like nr_sects)
- */
-#define RMR_MAX_MAPPED_SIZE    2097152
-
 /* The header structure of rmr pool metadata will not over this limit. */
 #define RMR_MD_SIZE		PAGE_SIZE
 #define RMR_MD_SIZE_SECTORS	(PAGE_SIZE / SECTOR_SIZE)

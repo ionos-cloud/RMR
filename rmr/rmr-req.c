@@ -109,7 +109,7 @@ struct rmr_srv_req *rmr_srv_req_create(const struct rmr_msg_io *msg, struct rmr_
 	req->id.a = le64_to_cpu(msg->id_a);
 	req->id.b = le64_to_cpu(msg->id_b);
 
-	req->offset = le32_to_cpu(msg->offset);
+	req->offset = le64_to_cpu(msg->offset);
 	req->length = le32_to_cpu(msg->length);
 	req->flags = le32_to_cpu(msg->flags);
 	req->prio = le16_to_cpu(msg->prio);
@@ -224,7 +224,7 @@ void rmr_req_submit(struct rmr_srv_req *req)
 		return;
 	}
 
-	pr_debug("check map for req %p flag %u request id [%llu, %llu] offset %u length %u\n",
+	pr_debug("check map for req %p flag %u request id [%llu, %llu] offset %llu length %u\n",
 		 req, req->flags,
 		 req->id.a, req->id.b, req->offset, req->length);
 
@@ -302,7 +302,7 @@ static void rmr_req_store(struct rmr_srv_req *req)
 {
 	int err;
 
-	pr_debug("submit to store req %p flags %u request id [%llu, %llu] offset %u length %u\n",
+	pr_debug("submit to store req %p flags %u request id [%llu, %llu] offset %llu length %u\n",
 		 req, req->flags,
 		 req->id.a, req->id.b, req->offset, req->length);
 
@@ -428,7 +428,7 @@ static void rmr_sync_req_sched(struct work_struct *work)
 
 static void rmr_req_complete(struct rmr_srv_req *req)
 {
-	pr_debug("send completeion for req %p flags %u request id (%llu, %llu) offset %u length %u err %d\n",
+	pr_debug("send completeion for req %p flags %u request id (%llu, %llu) offset %llu length %u err %d\n",
 		 req, req->flags,
 		 req->id.a, req->id.b, req->offset, req->length, req->err);
 
@@ -441,7 +441,7 @@ static void rmr_req_complete(struct rmr_srv_req *req)
 }
 
 static struct rmr_srv_req *rmr_req_create_sync_req(struct rmr_srv_pool *srv_pool, rmr_id_t id,
-						   u32 offset, u32 len, bool from_sync,
+						   u64 offset, u32 len, bool from_sync,
 						   struct rmr_srv_req *parent)
 {
 	struct rmr_srv_req *req;
@@ -480,7 +480,7 @@ static struct rmr_srv_req *rmr_req_create_sync_req(struct rmr_srv_pool *srv_pool
 	req->datalen = len;
 	req->parent = parent;
 
-	pr_debug("sync req %p created, flags %u request id (%llu, %llu) offset %u length %u parent %p\n",
+	pr_debug("sync req %p created, flags %u request id (%llu, %llu) offset %llu length %u parent %p\n",
 		 req, req->flags, req->id.a, req->id.b, req->offset, req->length, parent);
 
 	return req;
@@ -493,7 +493,8 @@ int rmr_srv_sync_chunk_id(struct rmr_srv_pool *srv_pool, struct rmr_map_entry *e
 	struct rmr_pool *pool = srv_pool->pool;
 	struct rmr_dirty_id_map *map;
 	struct rmr_srv_req *parent_req;
-	u32 max_io_size, total_len, offset;
+	u64 offset;
+	u32 max_io_size, total_len;
 
 	if (!srv_pool->clt) {
 		pr_err("For pool %s no sync pool assigned.\n", pool->poolname);
@@ -542,7 +543,7 @@ int rmr_srv_sync_chunk_id(struct rmr_srv_pool *srv_pool, struct rmr_map_entry *e
 	map_entry_get_sync(entry);
 	while (parent_req->length > max_io_size) {
 		struct rmr_srv_req *req;
-		u32 child_offset = offset + (parent_req->length - max_io_size);
+		u64 child_offset = offset + (parent_req->length - max_io_size);
 
 		// submit req
 		req = rmr_req_create_sync_req(srv_pool, id, (parent_req->length - max_io_size),
@@ -630,7 +631,7 @@ static void rmr_req_sync_complete(struct rmr_srv_req *req)
 	struct rmr_dirty_id_map *map;
 	int lock_idx;
 
-	pr_debug("sync_req %p completed for id (%llu, %llu), offset %u, len %u, err %d, from sync %d\n",
+	pr_debug("sync_req %p completed for id (%llu, %llu), offset %llu, len %u, err %d, from sync %d\n",
 		 req, req->id.a, req->id.b, req->offset, req->length,
 		 req->err, req->from_sync);
 
@@ -675,7 +676,7 @@ static void rmr_req_sync_failed(struct rmr_srv_req *req)
 {
 	rmr_srv_sync_req_failed(req->srv_pool);
 
-	pr_err("pool %s sync req %p failed for id (%llu, %llu), offset %u, len %u, err %d\n",
+	pr_err("pool %s sync req %p failed for id (%llu, %llu), offset %llu, len %u, err %d\n",
 	       req->srv_pool->pool->poolname, req, req->id.a, req->id.b,
 	       req->offset, req->length, req->err);
 
@@ -703,7 +704,7 @@ static void rmr_req_store_done(struct rmr_srv_req *req)
 	struct rmr_map_entry *entry = req->priv;
 	struct rmr_srv_req *parent_req = NULL;
 
-	pr_debug("called for req %p id (%llu, %llu ) offset %u len %u with parent req %p\n",
+	pr_debug("called for req %p id (%llu, %llu ) offset %llu len %u with parent req %p\n",
 		 req, req->id.a, req->id.b, req->offset, req->length, req->parent);
 
 	if (req->parent)
