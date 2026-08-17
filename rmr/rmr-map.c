@@ -176,7 +176,17 @@ struct rmr_dirty_id_map *rmr_map_create(struct rmr_pool *pool, u8 member_id)
 		goto err_map;
 	}
 
-	xa_init_flags(&map->rmr_id_map, XA_FLAGS_ALLOC);
+	/*
+	 * Every acquisition of this lock excludes interrupts, so the index can
+	 * be updated from IO completion, which may run in interrupt context.
+	 * Lockdep puts this lock in one class with the sub-block cache's
+	 * xa_lock, both being set up through xa_init_flags() here, so a cache
+	 * update from IO completion needs this as well. Inserts allocate with
+	 * GFP_KERNEL and run in process context through xa_insert_irq(); with
+	 * XA_FLAGS_LOCK_IRQ the allocation retry drops the lock with interrupts
+	 * enabled and retakes it with them disabled.
+	 */
+	xa_init_flags(&map->rmr_id_map, XA_FLAGS_ALLOC | XA_FLAGS_LOCK_IRQ);
 	xa_init(&map->subblk_cache);
 	spin_lock_init(&map->subblk_cache_lock);
 	map->pool = pool;
@@ -407,6 +417,7 @@ inline struct rmr_map_entry *rmr_map_unset_dirty(struct rmr_dirty_id_map *map, r
 						 u8 filter)
 {
 	struct rmr_map_entry *entry;
+	unsigned long flags;
 	u8 *chunk_md;
 	u64 i;
 
@@ -424,7 +435,9 @@ inline struct rmr_map_entry *rmr_map_unset_dirty(struct rmr_dirty_id_map *map, r
 		chunk_md++;
 	}
 
-	entry = xa_erase(&map->rmr_id_map, rmr_id_to_key(id));
+	xa_lock_irqsave(&map->rmr_id_map, flags);
+	entry = __xa_erase(&map->rmr_id_map, rmr_id_to_key(id));
+	xa_unlock_irqrestore(&map->rmr_id_map, flags);
 	if (!entry) {
 		pr_debug("in the member_id %d there is no entry for id [%llu, %llu]\n",
 			 map->member_id, id.a, id.b);
@@ -490,7 +503,7 @@ inline struct rmr_map_entry *rmr_map_get_dirty_entry(struct rmr_dirty_id_map *ma
 		atomic_set(&entry->sync_cnt, -1);
 		init_llist_head(&entry->wait_list);
 
-		err = xa_insert(&map->rmr_id_map, rmr_id_to_key(id), entry, GFP_KERNEL);
+		err = xa_insert_irq(&map->rmr_id_map, rmr_id_to_key(id), entry, GFP_KERNEL);
 		if (err == 0)
 			return entry;
 
@@ -658,7 +671,7 @@ inline int rmr_map_create_entries(struct rmr_dirty_id_map *map)
 		pr_debug("%s: Adding entry %p for chunk %llu\n",
 			 __func__, entry, i);
 
-		err = xa_insert(&map->rmr_id_map, rmr_id_to_key(id), entry, GFP_KERNEL);
+		err = xa_insert_irq(&map->rmr_id_map, rmr_id_to_key(id), entry, GFP_KERNEL);
 		if (err) {
 			pr_err("%s: Cannot insert entry for member_id %d, chunk %llu\n",
 			       __func__, map->member_id, i);
