@@ -346,9 +346,10 @@ static ssize_t rmr_clt_del_sess_store(struct kobject *kobj,
 		rmr_clt_pool_io_freeze(clt_pool);
 
 		/*
-		 * Wait for all completion
+		 * Wait for all completion (unbounded: del_sess must not erase a
+		 * member while IO to it is still in flight).
 		 */
-		rmr_clt_pool_io_wait_complete(clt_pool);
+		rmr_clt_pool_io_wait_complete(clt_pool, 0);
 
 		/*
 		 * Remove the storage node from the pool members list.

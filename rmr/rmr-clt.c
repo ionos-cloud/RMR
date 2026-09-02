@@ -596,8 +596,8 @@ void rmr_clt_close(struct rmr_pool *pool)
 	rmr_clt_pool_io_freeze(clt_pool);
 	pr_info("pool %s wait for inflight io to complete\n", clt_pool->pool->poolname);
 
-	/* Wait for all completion */
-	rmr_clt_pool_io_wait_complete(clt_pool);
+	/* Wait for all completion (unbounded: close must not drop in-flight IO) */
+	rmr_clt_pool_io_wait_complete(clt_pool, 0);
 
 	pr_info("pool %s inflight io completed\n", clt_pool->pool->poolname);
 
@@ -864,19 +864,39 @@ void rmr_clt_pool_io_unfreeze(struct rmr_clt_pool *clt_pool)
 
 	mutex_lock(&clt_pool->io_freeze_lock);
 	if (atomic_dec_return(&clt_pool->io_freeze) == 0) {
+		/*
+		 * resurrect, not reinit: a bounded wait may unfreeze with IO
+		 * still in flight, where reinit would WARN on a non-zero ref.
+		 * Resurrect first, so no further release can fire and set the
+		 * completion after reinit_completion() has cleared it.
+		 */
+		percpu_ref_resurrect(&pool->ids_inflight_ref);
 		reinit_completion(&pool->complete_done);
-		percpu_ref_reinit(&pool->ids_inflight_ref);
 
 		wake_up_all(&clt_pool->map_update_wq);
 	}
 	mutex_unlock(&clt_pool->io_freeze_lock);
 }
 
-void rmr_clt_pool_io_wait_complete(struct rmr_clt_pool *clt_pool)
+int rmr_clt_pool_io_wait_complete(struct rmr_clt_pool *clt_pool, unsigned int timeout_ms)
 {
 	struct rmr_pool *pool = clt_pool->pool;
+	unsigned long left;
 
-	wait_for_completion(&pool->complete_done);
+	if (!timeout_ms) {
+		wait_for_completion(&pool->complete_done);
+		return 0;
+	}
+
+	left = wait_for_completion_timeout(&pool->complete_done,
+					   msecs_to_jiffies(timeout_ms));
+	if (!left) {
+		pr_err("pool %s: inflight IO did not drain within %u ms\n",
+		       pool->poolname, timeout_ms);
+		return -ETIMEDOUT;
+	}
+
+	return 0;
 }
 
 //am: what kind of locking is rquired for that ?

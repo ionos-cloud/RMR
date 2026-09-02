@@ -18,6 +18,12 @@
 #define RMR_MAP_CLEAN_DELAY_MS	  5000
 #define RMR_RECOVER_INTERVAL_MS	  3000
 
+/*
+ * Upper bound on how long pool recovery waits for in-flight IO to drain before
+ * a map update. Recovery must not block forever on an IO that cannot complete.
+ */
+#define RMR_IO_FREEZE_DRAIN_TIMEOUT_MS	10000
+
 enum rmr_clt_sess_state {
 	RMR_CLT_SESS_DISCONNECTED = 1,
 	RMR_CLT_SESS_CONNECTED,
@@ -250,7 +256,7 @@ bool pool_sess_change_state(struct rmr_clt_pool_sess *pool_sess,
 
 void rmr_clt_pool_io_freeze(struct rmr_clt_pool *clt_pool);
 void rmr_clt_pool_io_unfreeze(struct rmr_clt_pool *clt_pool);
-void rmr_clt_pool_io_wait_complete(struct rmr_clt_pool *clt_pool);
+int rmr_clt_pool_io_wait_complete(struct rmr_clt_pool *clt_pool, unsigned int timeout_ms);
 int rmr_clt_pool_try_enable(struct rmr_pool *pool);
 int send_msg_enable_pool(struct rmr_clt_pool_sess *pool_sess, bool enable);
 

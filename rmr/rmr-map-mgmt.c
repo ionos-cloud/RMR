@@ -329,8 +329,18 @@ int rmr_clt_spread_map(struct rmr_pool *pool, struct rmr_clt_pool_sess *pool_ses
 		/* Freeze IOs */
 		rmr_clt_pool_io_freeze(clt_pool);
 
-		/* Wait for all completion */
-		rmr_clt_pool_io_wait_complete(clt_pool);
+		/*
+		 * Wait for in-flight IO to drain, bounded. Recovery runs on a
+		 * workqueue worker holding clt_pool_lock; an IO that never completes
+		 * must not wedge it forever. On timeout, unfreeze and fail.
+		 */
+		err = rmr_clt_pool_io_wait_complete(clt_pool,
+						    RMR_IO_FREEZE_DRAIN_TIMEOUT_MS);
+		if (err) {
+			pr_err("%s: pool %s aborting map update, inflight IO did not drain\n",
+			       __func__, pool->poolname);
+			goto err_out;
+		}
 	}
 
 	/*
