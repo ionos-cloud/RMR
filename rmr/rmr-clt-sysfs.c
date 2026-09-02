@@ -25,8 +25,6 @@
  */
 #define RTRS_RECONNECT_BACKOFF 1000
 
-#define RMR_DEFAULT_CHUNK_SIZE 131072 /* 128 KB */
-
 static struct class *rmr_dev_class;
 static struct device *rmr_ctl_dev;
 static struct device *rmr_pool_dev;

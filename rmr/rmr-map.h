@@ -10,6 +10,10 @@
 
 #include <linux/types.h>
 #include <linux/xarray.h>
+#include <linux/bitmap.h>
+#include <linux/spinlock.h>
+#include <linux/slab.h>
+#include <linux/math.h>
 
 #include "rmr.h"
 
@@ -96,6 +100,37 @@
 
 #define CHUNK_TO_OFFSET(chunk_no, shift)       (chunk_no << shift)
 
+/*
+ * Chunk size bounds. The byte values are the source of truth: chunk_size is a
+ * byte-valued module parameter, validated as a power of two within these
+ * bounds, and pool->chunk_size_shift is ilog2() of it.
+ */
+#define RMR_MIN_CHUNK_SIZE		(128 << 10)
+#define RMR_MAX_CHUNK_SIZE		(1024 << 10)
+#define RMR_MAX_CHUNK_SIZE_SHIFT	ilog2(RMR_MAX_CHUNK_SIZE)
+#define RMR_DEFAULT_CHUNK_SIZE		RMR_MIN_CHUNK_SIZE	/* 128 KB */
+
+/*
+ * Sub-block dirty tracking.
+ *
+ * A dirty chunk is tracked at this finer grain so that a write which fully
+ * covers a sub-block can be applied directly to the backend and that sub-block
+ * marked in sync. The chunk remains the unit that tracks dirty data; the
+ * sub-block is only the unit of data that needs to be synced within a dirty
+ * chunk.
+ *
+ * RMR_MAX_SUBBLK sizes rmr_subblk_slot.bits for the largest chunk allowed, so
+ * derive it from the same value the parameter is checked against rather than
+ * from a second copy of the limit.
+ */
+#define RMR_SUBBLK_SHIFT	12			/* 4 KiB */
+#define RMR_SUBBLK_SIZE		BIT(RMR_SUBBLK_SHIFT)
+#define RMR_MAX_SUBBLK		(1U << (RMR_MAX_CHUNK_SIZE_SHIFT - RMR_SUBBLK_SHIFT))
+
+/* Below this, chunk_size_shift - RMR_SUBBLK_SHIFT underflows. */
+static_assert(RMR_MIN_CHUNK_SIZE >= RMR_SUBBLK_SIZE,
+	      "a chunk must hold at least one sub-block");
+
 // The element type stored in FLP
 typedef unsigned long	el_flp;
 
@@ -155,6 +190,23 @@ struct rmr_dirty_id_map {
 	u64		total_slp;
 	u8		*bitmap_filter;
 	void		*dirty_bitmap[MAX_NO_OF_FLP];
+};
+
+/*
+ * Sub-block dirty tracking within a dirty chunk. A set bit in @bits means
+ * the sub-block still needs syncing from a clean peer. It is cleared only when
+ * the sub-block holds current data, either written whole or pulled by a sync.
+ * Guarded by @lock.
+ *
+ * Held in a bounded cache keyed by chunk id. @nr_dirty reaching 0 does not
+ * by itself make the chunk clean; see rmr_subblk_slot_clear().
+ */
+struct rmr_subblk_slot {
+	spinlock_t lock;	/* guards @bits and @nr_dirty */
+	u16 nr_subblk;
+	u16 nr_dirty;
+	DECLARE_BITMAP(bits, RMR_MAX_SUBBLK);
+	struct rcu_head rcu;
 };
 
 struct rmr_map_entry {
@@ -218,6 +270,180 @@ u64 rmr_map_buf_to_slps(struct rmr_dirty_id_map *map, u8 *buf, u32 buf_size, u64
 void rmr_map_dump_bitmap(struct rmr_dirty_id_map *map);
 int rmr_map_summary_format(struct rmr_pool *pool, char *buf, size_t buf_size);
 void rmr_map_bidump_bitmap_buf(void *buf, u8 member_id, u32 buf_size);
+
+/**
+ * rmr_subblk_slot_alloc() - allocate a slot for a dirty chunk and initialize
+ * every sub-block as dirty.
+ *
+ * @nr_subblk:	number of sub-blocks in the chunk.
+ *
+ * Description:
+ *	The whole chunk is out of sync when its slot is first created, so all
+ *	@nr_subblk sub-blocks start dirty.
+ *
+ * Return:
+ *	pointer to the new slot, or NULL on allocation failure.
+ */
+static inline struct rmr_subblk_slot *rmr_subblk_slot_alloc(u32 nr_subblk)
+{
+	struct rmr_subblk_slot *slot;
+
+	/* Cannot sleep since inside rcu_read_lock */
+	slot = kmalloc(sizeof(*slot), GFP_NOWAIT);
+	if (!slot)
+		return NULL;
+
+	spin_lock_init(&slot->lock);
+	slot->nr_subblk = nr_subblk;
+	slot->nr_dirty = nr_subblk;
+	/* Set exactly nr_subblk bits; bitmap_fill() would round up to longs. */
+	bitmap_zero(slot->bits, RMR_MAX_SUBBLK);
+	bitmap_set(slot->bits, 0, nr_subblk);
+	return slot;
+}
+
+/**
+ * rmr_subblk_covered() - sub-blocks a byte range fully covers within a chunk.
+ *
+ * @chunk_size_shift:	log2(chunk_size); used to compute chunk-relative offset.
+ * @off:		absolute byte offset of the IO.
+ * @len:		byte length of the IO.
+ * @first:		out: index of the first fully-covered sub-block.
+ *			Untouched when the return value is 0.
+ *
+ * Description:
+ *	Rounds inward: a sub-block the range only partly overlaps is not
+ *	counted. Contrast rmr_subblk_touched(), which rounds outward.
+ *
+ * Return:
+ *	number of fully-covered sub-blocks (0 if none).
+ */
+static inline u32 rmr_subblk_covered(u8 chunk_size_shift, u64 off, u32 len,
+				     u32 *first)
+{
+	u64 start = off & ((1ULL << chunk_size_shift) - 1);
+	u64 end = start + len;
+	u64 fb = round_up(start, RMR_SUBBLK_SIZE) >> RMR_SUBBLK_SHIFT;
+	u64 lb = end >> RMR_SUBBLK_SHIFT;	/* exclusive, rounded down */
+
+	if (lb <= fb)
+		return 0;
+	*first = (u32)fb;
+	return (u32)(lb - fb);
+}
+
+/**
+ * rmr_subblk_slot_clear() - mark @count sub-blocks from @first as in-sync.
+ *
+ * @slot:	the sub-block slot to update.
+ * @first:	index of the first sub-block to clear.
+ * @count:	number of consecutive sub-blocks to clear.
+ *
+ * Description:
+ *	Clearing bits does not by itself license clearing the chunk's coarse
+ *	dirty bit: the slot may be detached from the cache by a concurrent
+ *	re-dirty. Callers ask rmr_subblk_take_if_clean() for that
+ *	verdict instead, so no in-sync count is returned here.
+ */
+static inline void rmr_subblk_slot_clear(struct rmr_subblk_slot *slot,
+					 u32 first, u32 count)
+{
+	unsigned long flags;
+	u32 i, end = first + count;
+
+	if (end > slot->nr_subblk)
+		end = slot->nr_subblk;
+
+	spin_lock_irqsave(&slot->lock, flags);
+	for (i = first; i < end; i++) {
+		if (test_and_clear_bit(i, slot->bits) &&
+		    !WARN_ON_ONCE(!slot->nr_dirty))
+			slot->nr_dirty--;
+	}
+	spin_unlock_irqrestore(&slot->lock, flags);
+}
+
+/**
+ * rmr_subblk_slot_set_dirty() - mark @count sub-blocks from @first as needing
+ * sync again. Inverse of rmr_subblk_slot_clear().
+ *
+ * @slot:	the sub-block slot to update.
+ * @first:	index of the first sub-block to re-dirty.
+ * @count:	number of consecutive sub-blocks to re-dirty.
+ *
+ * Description:
+ *	Used to undo a write the pool did not accept, so its sub-blocks
+ *	stop counting as in sync and are re-pulled from the source. Already
+ *	dirty sub-blocks stay dirty. The range is clamped to the slot's
+ *	sub-block count.
+ */
+static inline void rmr_subblk_slot_set_dirty(struct rmr_subblk_slot *slot,
+					     u32 first, u32 count)
+{
+	unsigned long flags;
+	u32 i, end = first + count;
+
+	if (end > slot->nr_subblk)
+		end = slot->nr_subblk;
+
+	spin_lock_irqsave(&slot->lock, flags);
+	for (i = first; i < end; i++) {
+		if (!test_and_set_bit(i, slot->bits))
+			slot->nr_dirty++;
+	}
+	spin_unlock_irqrestore(&slot->lock, flags);
+}
+
+/**
+ * rmr_subblk_touched() - count the sub-blocks a byte range overlaps.
+ *
+ * @chunk_size_shift:	log2 of the chunk size in bytes.
+ * @off:		byte offset of the range; only its position within the
+ *			chunk (off % chunk_size) matters.
+ * @len:		length of the range in bytes.
+ * @first:		set to the index of the first overlapped sub-block.
+ *
+ * Description:
+ *	Rounds the start down and the end up, so a range that only partially
+ *	covers an edge sub-block still counts it. This is the read-modify-write
+ *	footprint of a write. Contrast rmr_subblk_covered(), which rounds
+ *	inward to the sub-blocks a write fully covers.
+ *
+ * Return:
+ *	number of sub-blocks the range touches, or 0 for a zero-length range.
+ */
+static inline u32 rmr_subblk_touched(u8 chunk_size_shift, u64 off, u32 len,
+				     u32 *first)
+{
+	u64 start = off & ((1ULL << chunk_size_shift) - 1);
+	u64 end = start + len;
+	u64 fb = start >> RMR_SUBBLK_SHIFT;
+	u64 lb = round_up(end, RMR_SUBBLK_SIZE) >> RMR_SUBBLK_SHIFT;
+
+	if (!len)
+		return 0;
+	*first = (u32)fb;
+	return (u32)(lb - fb);
+}
+
+/**
+ * rmr_subblk_slot_all_clean() - check whether all sub-blocks are in sync.
+ *
+ * @slot:	the sub-block slot to check.
+ *
+ * Return:
+ *	true if no sub-block of @slot still needs syncing.
+ */
+static inline bool rmr_subblk_slot_all_clean(struct rmr_subblk_slot *slot)
+{
+	unsigned long flags;
+	bool all_clean;
+
+	spin_lock_irqsave(&slot->lock, flags);
+	all_clean = (slot->nr_dirty == 0);
+	spin_unlock_irqrestore(&slot->lock, flags);
+	return all_clean;
+}
 
 static inline void map_entry_get_sync(struct rmr_map_entry *entry)
 {

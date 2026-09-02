@@ -26,17 +26,13 @@ struct kmem_cache *rmr_req_cachep;
 static LIST_HEAD(g_sess_list);
 static DEFINE_MUTEX(g_sess_lock);
 
-#define MIN_CHUNK_SIZE (128 << 10)
-#define MAX_CHUNK_SIZE (1024 << 10)
-#define DEFAULT_CHUNK_SIZE MIN_CHUNK_SIZE
-
-static int __read_mostly chunk_size = DEFAULT_CHUNK_SIZE;
+static int __read_mostly chunk_size = RMR_DEFAULT_CHUNK_SIZE;
 
 module_param_named(chunk_size, chunk_size, uint, 0444);
 MODULE_PARM_DESC(chunk_size,
 		 "Unit size which is tracked for being dirty. (default: "
 		 /* cppcheck-suppress unknownMacro */
-		 __stringify(DEFAULT_CHUNK_SIZE) "KB)");
+		 __stringify(RMR_DEFAULT_CHUNK_SIZE) "KB)");
 
 static int __read_mostly sync_queue_depth = DEFAULT_SYNC_QUEUE_DEPTH;
 
@@ -3220,11 +3216,11 @@ static int __init rmr_srv_init_module(void)
 	int err;
 
 	if (!is_power_of_2(chunk_size) ||
-	    chunk_size < MIN_CHUNK_SIZE || chunk_size > MAX_CHUNK_SIZE) {
+	    chunk_size < RMR_MIN_CHUNK_SIZE || chunk_size > RMR_MAX_CHUNK_SIZE) {
 		pr_err("Loading module %s failed. Invalid chunk_size %u\n",
 			KBUILD_MODNAME, chunk_size);
 		pr_err("Chunk size should be a power of 2, and between (min %u - max %u)\n",
-			MIN_CHUNK_SIZE, MAX_CHUNK_SIZE);
+			RMR_MIN_CHUNK_SIZE, RMR_MAX_CHUNK_SIZE);
 		return -EINVAL;
 	}
 
