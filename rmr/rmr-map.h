@@ -490,6 +490,30 @@ static inline u32 rmr_subblk_touched(u8 chunk_size_shift, u64 off, u32 len,
 }
 
 /**
+ * rmr_subblk_slot_nr_dirty() - count the sub-blocks that still need syncing.
+ *
+ * @slot:	the sub-block slot to read.
+ *
+ * Context:
+ *	Call with rcu_read_lock() held, since slots are freed with kfree_rcu()
+ *	and that read section is what keeps @slot alive. Takes @slot->lock.
+ *
+ * Return:
+ *	the number of the chunk's sub-blocks that still need syncing from a
+ *	clean peer.
+ */
+static inline u16 rmr_subblk_slot_nr_dirty(struct rmr_subblk_slot *slot)
+{
+	unsigned long flags;
+	u16 nr_dirty;
+
+	spin_lock_irqsave(&slot->lock, flags);
+	nr_dirty = slot->nr_dirty;
+	spin_unlock_irqrestore(&slot->lock, flags);
+	return nr_dirty;
+}
+
+/**
  * rmr_subblk_slot_all_clean() - check whether all sub-blocks are in sync.
  *
  * @slot:	the sub-block slot to check.
@@ -499,13 +523,7 @@ static inline u32 rmr_subblk_touched(u8 chunk_size_shift, u64 off, u32 len,
  */
 static inline bool rmr_subblk_slot_all_clean(struct rmr_subblk_slot *slot)
 {
-	unsigned long flags;
-	bool all_clean;
-
-	spin_lock_irqsave(&slot->lock, flags);
-	all_clean = (slot->nr_dirty == 0);
-	spin_unlock_irqrestore(&slot->lock, flags);
-	return all_clean;
+	return rmr_subblk_slot_nr_dirty(slot) == 0;
 }
 
 static inline void map_entry_get_sync(struct rmr_map_entry *entry)

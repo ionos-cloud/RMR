@@ -758,6 +758,102 @@ static ssize_t map_summary_show(struct kobject *kobj,
 static struct kobj_attribute rmr_srv_pool_map_summary_attr =
 	__ATTR_RO(map_summary);
 
+static ssize_t subblk_cache_kb_show(struct kobject *kobj,
+				    struct kobj_attribute *attr,
+				    char *page)
+{
+	struct rmr_pool *pool = container_of(kobj, struct rmr_pool, kobj);
+
+	return sysfs_emit(page, "%u\n", READ_ONCE(pool->subblk_cache_kb));
+}
+
+/* Pairs subblk_cache_kb with the slot count derived from it across writers. */
+static DEFINE_MUTEX(subblk_cache_kb_lock);
+
+static ssize_t subblk_cache_kb_store(struct kobject *kobj,
+				     struct kobj_attribute *attr,
+				     const char *buf, size_t count)
+{
+	struct rmr_pool *pool = container_of(kobj, struct rmr_pool, kobj);
+	u32 val;
+	int err;
+
+	err = kstrtou32(buf, 0, &val);
+	if (err)
+		return err;
+
+	if (val < RMR_SUBBLK_CACHE_KB_MIN || val > RMR_SUBBLK_CACHE_KB_MAX)
+		return -EINVAL;
+
+	/*
+	 * The KiB value is what the user reads back; the slot count derived
+	 * from it is what admission compares against. Both are updated here
+	 * so a write takes effect without the IO path recomputing a budget,
+	 * and under the mutex so two concurrent writes cannot leave one
+	 * write's value with the other's count.
+	 */
+	mutex_lock(&subblk_cache_kb_lock);
+	WRITE_ONCE(pool->subblk_cache_kb, val);
+	WRITE_ONCE(pool->subblk_slots_max, rmr_subblk_kb_to_slots(val));
+	mutex_unlock(&subblk_cache_kb_lock);
+
+	return count;
+}
+
+static struct kobj_attribute rmr_srv_pool_subblk_cache_kb_attr =
+	__ATTR_RW(subblk_cache_kb);
+
+/*
+ * One line per cached sub-block slot, so the sub-block state of a PARTIAL
+ * chunk is observable:
+ *
+ *	<member_id> <chunk> <nr_dirty> <nr_subblk>
+ *
+ * A chunk with no line either holds no dirty data at all or is tracked at
+ * chunk granularity only (FULLY_DIRTY). Output is truncated with a trailing
+ * "..." line if the cache does not fit in one page.
+ */
+static ssize_t subblk_map_show(struct kobject *kobj,
+			       struct kobj_attribute *attr,
+			       char *page)
+{
+	struct rmr_pool *pool = container_of(kobj, struct rmr_pool, kobj);
+	struct rmr_dirty_id_map *map;
+	struct rmr_subblk_slot *s;
+	unsigned long chunk;
+	int i, lock_idx;
+	ssize_t len = 0;
+
+	lock_idx = srcu_read_lock(&pool->map_srcu);
+	for (i = 0; i < RMR_POOL_MAX_SESS; i++) {
+		map = rcu_dereference(pool->maps[i]);
+		if (!map)
+			continue;
+
+		rcu_read_lock();
+		xa_for_each(&map->subblk_cache, chunk, s) {
+			if (len > PAGE_SIZE - 64) {
+				len += sysfs_emit_at(page, len, "...\n");
+				rcu_read_unlock();
+				goto out;
+			}
+
+			len += sysfs_emit_at(page, len, "%u %lu %u %u\n",
+					     map->member_id, chunk,
+					     rmr_subblk_slot_nr_dirty(s),
+					     s->nr_subblk);
+		}
+		rcu_read_unlock();
+	}
+out:
+	srcu_read_unlock(&pool->map_srcu, lock_idx);
+
+	return len;
+}
+
+static struct kobj_attribute rmr_srv_pool_subblk_map_attr =
+	__ATTR_RO(subblk_map);
+
 static struct attribute *rmr_srv_pool_attrs[] = {
 	&rmr_srv_leave_pool_attr.attr,
 	&rmr_srv_member_id_attr.attr,
@@ -775,6 +871,8 @@ static struct attribute *rmr_srv_pool_attrs[] = {
 	&rmr_srv_pool_map_update_state_attr.attr,
 	&rmr_srv_pool_map_unsynced_attr.attr,
 	&rmr_srv_pool_map_summary_attr.attr,
+	&rmr_srv_pool_subblk_cache_kb_attr.attr,
+	&rmr_srv_pool_subblk_map_attr.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(rmr_srv_pool);
