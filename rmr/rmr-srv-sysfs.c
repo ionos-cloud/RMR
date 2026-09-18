@@ -871,9 +871,8 @@ static int rmr_srv_parse_options(const char *buf, char *poolname,
 				ret = -ENOMEM;
 				goto out;
 			}
-			if (strlen(p) > NAME_MAX) {
-				pr_err("join_pool: name too long\n");
-				ret = -EINVAL;
+			ret = rmr_check_poolname(p);
+			if (ret) {
 				kfree(p);
 				goto out;
 			}

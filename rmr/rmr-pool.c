@@ -8,6 +8,7 @@
 #include <linux/wait.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
+#include <linux/ctype.h>
 
 #include "rmr-pool.h"
 
@@ -193,6 +194,42 @@ cleanup_sess_srcu:
 free_pool:
 	kfree(pool);
 	return pool;
+}
+
+/*
+ * A poolname becomes a sysfs directory name and a workqueue name, and is
+ * carried over the wire, so restrict it to a portable filename character
+ * set: alphanumerics plus '-' and '_'.  '.' is left out so that "." and
+ * ".." cannot be built at all, the same way rtrs rejects '.' in a path
+ * name.
+ */
+int rmr_check_poolname(const char *poolname)
+{
+	size_t len = strlen(poolname);
+	size_t i;
+
+	if (!len) {
+		pr_err("poolname must not be empty\n");
+		return -EINVAL;
+	}
+
+	if (len >= NAME_MAX) {
+		pr_err("poolname is too long, max %d characters\n", NAME_MAX - 1);
+		return -EINVAL;
+	}
+
+	for (i = 0; i < len; i++) {
+		char c = poolname[i];
+
+		if (isalnum(c) || c == '-' || c == '_')
+			continue;
+
+		pr_err("poolname has an invalid character at position %zu, allowed are [A-Za-z0-9_-]\n",
+		       i);
+		return -EINVAL;
+	}
+
+	return 0;
 }
 
 struct rmr_pool *rmr_create_pool(const char *poolname, void *priv)

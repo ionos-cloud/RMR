@@ -237,6 +237,7 @@ extern struct mutex pool_mutex;
 
 const char *rmr_get_cmd_name(enum rmr_msg_cmd_type cmd);
 
+int rmr_check_poolname(const char *poolname);
 struct rmr_pool *rmr_create_pool(const char *poolname, void *priv);
 void free_pool(struct rmr_pool *pool);
 
