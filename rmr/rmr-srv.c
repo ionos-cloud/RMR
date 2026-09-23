@@ -449,6 +449,7 @@ struct rmr_srv_pool *rmr_create_srv_pool(char *poolname, u32 member_id)
 	srv_pool->th_tsk = NULL;
 	atomic_set(&srv_pool->thread_state, SYNC_THREAD_STOPPED);
 	atomic_set(&srv_pool->in_flight_sync_reqs, 0);
+	atomic_set(&srv_pool->sync_parents, 0);
 
 	/* clean outdated entries from the map work */
 	srv_pool->clean_wq = alloc_workqueue("%s_clean_wq", 0, 0, poolname);
@@ -1441,6 +1442,18 @@ void rmr_srv_put_sync_permit(struct rmr_srv_pool *srv_pool)
 	wake_up_process(srv_pool->th_tsk);
 }
 
+/*
+ * A background parent sync was released. The pool can be freed as soon as
+ * the count drops to zero, so the wake-up uses only the counter's address.
+ */
+void rmr_srv_put_sync_parent(struct rmr_srv_pool *srv_pool)
+{
+	atomic_t *parents = &srv_pool->sync_parents;
+
+	if (atomic_dec_and_test(parents))
+		wake_up_var(parents);
+}
+
 static int rmr_srv_sync_map(void *arg)
 {
 	struct rmr_srv_pool *srv_pool = arg;
@@ -1491,8 +1504,9 @@ static int rmr_srv_sync_map(void *arg)
 
 			err = rmr_srv_sync_chunk_id(srv_pool, entry, rmr_id, true);
 			if (err) {
-				/* this is to undo the previous cmpxchg if the error in
-				 * rmr_srv_sync_chunk_id happened before any requests were created
+				/*
+				 * A negative return means nothing was launched
+				 * and we still own the claim, so release it.
 				 */
 				atomic_cmpxchg(&entry->sync_cnt, 0, -1);
 				pr_err("Failed to sync chunk (%llu, %llu)\n", rmr_id.a, rmr_id.b);
@@ -1519,6 +1533,14 @@ err:
 		schedule();
 		//TODO: should it be timeout?
 	}
+
+	/*
+	 * A background parent holds no permit, but still sends MAP_CLEAR and
+	 * releases its chunk after the last child. Wait for those too, so
+	 * Stopped means the sweep has finished.
+	 */
+	wait_var_event_interruptible(&srv_pool->sync_parents,
+				     !atomic_read(&srv_pool->sync_parents));
 
 out:
 	atomic_set(&srv_pool->thread_state, SYNC_THREAD_STOPPED);

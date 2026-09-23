@@ -273,6 +273,7 @@ enum rmr_subblk_state {
 
 enum rmr_subblk_state rmr_subblk_take_if_clean(struct rmr_dirty_id_map *map,
 					       u64 chunk);
+void rmr_map_erase_entry(struct rmr_dirty_id_map *map, rmr_id_t id);
 
 bool rmr_subblk_snapshot_bits(struct rmr_dirty_id_map *map, u64 chunk,
 			      unsigned long *dst_bits, u32 *nr_subblk);

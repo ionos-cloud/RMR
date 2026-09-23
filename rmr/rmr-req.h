@@ -37,6 +37,19 @@ struct rmr_srv_req {
 	struct rmr_iu *iu;
 	struct rmr_srv_req *parent;
 	bool sync;
+	/*
+	 * Set on a parent sync req that found a slot when the transfer started.
+	 * A slot missing at completion then means this node's own map was
+	 * marked dirty again or reset while the sync ran, which is a different
+	 * situation from a chunk that never had one.
+	 */
+	bool had_slot;
+	/*
+	 * Set when the sync did not take the chunk clean. The release callback
+	 * then lets go of the claim and does not free the entry, which stays in
+	 * the index for the next sync unless a map reset dropped it.
+	 */
+	bool keep_entry;
 	struct rcu_head rcu;
 };
 

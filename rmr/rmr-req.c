@@ -420,10 +420,7 @@ static void rmr_sync_req_sched(struct work_struct *work)
 	struct rmr_srv_req *req = container_of(work, struct rmr_srv_req, work);
 
 	pr_debug("scheduled work process for req %p\n", req);
-	if (req->err)
-		rmr_req_sync_complete(req);
-	else
-		rmr_req_send_map_clear(req);
+	rmr_req_sync_complete(req);
 }
 
 static void rmr_req_complete(struct rmr_srv_req *req)
@@ -486,28 +483,54 @@ static struct rmr_srv_req *rmr_req_create_sync_req(struct rmr_srv_pool *srv_pool
 	return req;
 }
 
-//should be called only if corresponding map entry has 0 sync cnt
+/**
+ * rmr_srv_sync_chunk_id() - sync the dirty sub-blocks of a chunk.
+ *
+ * @srv_pool:	the server pool driving the sync.
+ * @entry:	the map entry for @id; caller holds the sync claim.
+ * @id:		chunk id to sync.
+ * @from_sync:	true if from the background sweep, false for demand sync.
+ *
+ * Description:
+ *	With a slot, issues remote_read children for each dirty sub-block run
+ *	of a snapshot of the slot; without one, for the whole chunk. The
+ *	parent's completion runs when the last reference drops, from the last
+ *	child, or from here if every child finished during issuing.
+ *
+ * Return:
+ *	0 once the sync has been launched, which includes the case where it was
+ *	launched and then abandoned part way through issuing, since the parent's
+ *	completion then reports that error and releases the chunk's sync claim.
+ *	A negative errno means nothing was launched and the caller still owns
+ *	the claim.
+ */
 int rmr_srv_sync_chunk_id(struct rmr_srv_pool *srv_pool, struct rmr_map_entry *entry,
 			  rmr_id_t id, bool from_sync)
 {
 	struct rmr_pool *pool = srv_pool->pool;
 	struct rmr_dirty_id_map *map;
 	struct rmr_srv_req *parent_req;
+	DECLARE_BITMAP(bits_snap, RMR_MAX_SUBBLK);
 	u64 offset;
-	u32 max_io_size, total_len;
+	u32 max_io_size, total_len, nr_subblk;
+	unsigned int run_first, run_end;
+	bool had_slot;
+	int lock_idx;
 
 	if (!srv_pool->clt) {
 		pr_err("For pool %s no sync pool assigned.\n", pool->poolname);
 		return -EINVAL;
 	}
-	max_io_size = srv_pool->max_sync_io_size;
 
-	map = rmr_pool_find_map(pool, srv_pool->member_id);
-	if (!map) {
-		pr_err("no map found for pool_id %u\n", srv_pool->member_id);
-		//TODO: handle this , probably initialize map, or just throw err?
+	/*
+	 * Tile on sub-block boundaries. rmr_subblk_covered() rounds inward, so
+	 * a sub-block split across two child slices is fully covered by
+	 * neither and would be cleared by neither, leaving it dirty after a
+	 * transfer that did write it.
+	 */
+	max_io_size = ALIGN_DOWN(srv_pool->max_sync_io_size, RMR_SUBBLK_SIZE);
+	if (WARN_ON_ONCE(!max_io_size))
 		return -EINVAL;
-	}
 
 	offset = CHUNK_TO_OFFSET(id.b, pool->chunk_size_shift);
 	total_len = pool->chunk_size;
@@ -516,121 +539,267 @@ int rmr_srv_sync_chunk_id(struct rmr_srv_pool *srv_pool, struct rmr_map_entry *e
 		 pool->poolname, id.a, id.b, total_len, max_io_size);
 
 	/*
-	 * The parent_req starts with total_len, then get decremented in loop below.
-	 * The child reqs are filled one by one from end to second.
-	 *
-	 * Maybe refactor this to a simple loop?
+	 * Coordinator parent: owns the scratch buffer and the chunk's sync
+	 * completion, but does not itself read from the peer. Children read
+	 * each dirty run from the peer and store into parent_req->data at
+	 * their in-chunk offset. We hold one issuing ref on the entry for
+	 * the parent and drop it after all children are issued, so a fast
+	 * child completion cannot tear the chunk down mid-issue.
 	 */
 	parent_req = rmr_req_create_sync_req(srv_pool, id, offset, total_len, from_sync, NULL);
-	if (IS_ERR_OR_NULL(parent_req)) {
+	if (IS_ERR(parent_req)) {
 		pr_err("pool %s failed to create main sync req to sync id (%llu, %llu)\n",
 		       pool->poolname, id.a, id.b);
 		return -ENOMEM;
 	}
 	parent_req->priv = entry;
 
-	if (from_sync) {
-		if (rmr_srv_get_sync_permit(srv_pool)) {
-			pr_err("rmr_srv_sync_chunk_id failed to acquire permit for parent\n");
-			kfree(parent_req->data);
-			kmem_cache_free(rmr_req_cachep, parent_req);
+	/*
+	 * Walk the dirty sub-block runs and sync only those, so a sub-block the
+	 * client already wrote is not re-pulled.
+	 *
+	 * The loop below calls rmr_srv_get_sync_permit() which may sleep.
+	 * We cannot hold RCU across a sleep, so snapshot the dirty bitmap
+	 * into a local buffer up front under RCU and walk the snapshot.
+	 */
+	bitmap_zero(bits_snap, RMR_MAX_SUBBLK);
 
-			return -EINVAL;
-		}
+	/*
+	 * rmr_pool_find_map() returns the pointer unprotected and the map
+	 * page is freed once synchronize_srcu(&pool->map_srcu) has passed,
+	 * without waiting on pool->ids_inflight_ref. Hold map_srcu across
+	 * the lookup and the snapshot it feeds.
+	 */
+	lock_idx = srcu_read_lock(&pool->map_srcu);
+	map = rmr_pool_find_map(pool, srv_pool->member_id);
+	if (!map) {
+		pr_err("no map found for pool_id %u\n", srv_pool->member_id);
+		srcu_read_unlock(&pool->map_srcu, lock_idx);
+		/* TODO: Handle this? How? */
+		kfree(parent_req->data);
+		kmem_cache_free(rmr_req_cachep, parent_req);
+		return -EINVAL;
 	}
 
-	// inc ref cnt for parent_req
+	rcu_read_lock();
+	had_slot = rmr_subblk_snapshot_bits(map, id.b, bits_snap, &nr_subblk);
+	rcu_read_unlock();
+	srcu_read_unlock(&pool->map_srcu, lock_idx);
+
+	if (from_sync)
+		atomic_inc(&srv_pool->sync_parents);
+
+	/* inc ref cnt for parent_req (issuing ref) */
 	map_entry_get_sync(entry);
-	while (parent_req->length > max_io_size) {
-		struct rmr_srv_req *req;
-		u64 child_offset = offset + (parent_req->length - max_io_size);
 
-		// submit req
-		req = rmr_req_create_sync_req(srv_pool, id, (parent_req->length - max_io_size),
-					      max_io_size, from_sync, parent_req);
-		if (IS_ERR_OR_NULL(req)) {
-			pr_err("%s: Pool %s, id (%llu, %llu), offset %u, len %u, err %ld\n",
-			       __func__, pool->poolname, id.a, id.b,
-			       (parent_req->length - max_io_size), max_io_size, PTR_ERR(req));
-			parent_req->err = PTR_ERR(req);
+	/*
+	 * A transfer that walked a slot moves only its dirty runs, so its
+	 * completion cannot conclude the chunk converged once the slot is gone.
+	 */
+	parent_req->had_slot = had_slot;
 
-			rmr_req_sync_failed(parent_req);
-			return -EINVAL;
-		}
-
-		/*
-		 * The offset sent to rmr_req_create_sync_req for this req is in context of the
-		 * chunk. But the real offset for this req in the disk is this.
-		 */
-		req->offset = child_offset;
-
-		if (from_sync) {
-			if (rmr_srv_get_sync_permit(srv_pool)) {
-				pr_err("rmr_srv_sync_chunk_id failed to acquire permit for child\n");
-				kmem_cache_free(rmr_req_cachep, req);
-
-				parent_req->err = -EBUSY;
-				rmr_req_sync_failed(parent_req);
-				return -EINVAL;
-			}
-		}
-
-		// inc ref cnt for the child req just created
-		map_entry_get_sync(entry);
-		req->priv = entry;
-		rmr_req_remote_read(req);
-
-		parent_req->length -= max_io_size;
-		parent_req->datalen -= max_io_size;
+	/* Without a slot the whole chunk is dirty, and synced as one run. */
+	if (!had_slot) {
+		nr_subblk = total_len >> RMR_SUBBLK_SHIFT;
+		bitmap_set(bits_snap, 0, nr_subblk);
 	}
 
-	//submit parent req
-	rmr_req_remote_read(parent_req);
+	for_each_set_bitrange(run_first, run_end, bits_snap, nr_subblk) {
+		u64 run_off = offset + ((u64)run_first << RMR_SUBBLK_SHIFT);
+		u32 run_len = (run_end - run_first) << RMR_SUBBLK_SHIFT;
+		u32 done;
 
+		/* tile the run into <= max_io_size child reqs */
+		for (done = 0; done < run_len; done += max_io_size) {
+			struct rmr_srv_req *req;
+			u64 slice_off = run_off + done;
+			u32 slice_len = min_t(u32, max_io_size, run_len - done);
+			u32 in_chunk = (u32)(slice_off - offset);
+
+			if (from_sync && rmr_srv_get_sync_permit(srv_pool)) {
+				pr_err("%s failed to acquire permit for child\n",
+				       __func__);
+				parent_req->err = -EBUSY;
+				goto abandon;
+			}
+
+			req = rmr_req_create_sync_req(srv_pool, id, in_chunk, slice_len,
+						      from_sync, parent_req);
+			if (IS_ERR(req)) {
+				pr_err("%s: Pool %s, id (%llu, %llu), in_chunk %u, len %u, err %ld\n",
+				       __func__, pool->poolname, id.a, id.b,
+				       in_chunk, slice_len, PTR_ERR(req));
+				parent_req->err = PTR_ERR(req);
+				goto put_permit;
+			}
+
+			req->offset = slice_off;
+			req->priv = entry;
+
+			/* inc ref cnt for the child req just created */
+			map_entry_get_sync(entry);
+			rmr_req_remote_read(req);
+		}
+	}
+
+	/*
+	 * Drop the coordinator's issuing ref. If every child has already finished,
+	 * trigger the chunk's sync completion now; otherwise the last child does.
+	 */
+	if (map_entry_put_sync(entry)) {
+		INIT_WORK(&parent_req->work, rmr_sync_req_sched);
+		schedule_work(&parent_req->work);
+	}
+
+	return 0;
+
+put_permit:
+	if (from_sync)
+		rmr_srv_put_sync_permit(srv_pool);
+abandon:
+	/*
+	 * The issuing ref is taken, so the parent's completion owns the claim
+	 * and reports the error. Returning it to the caller as well would have
+	 * the caller release a claim a child still in flight is holding,
+	 * driving sync_cnt below -1 where no cmpxchg can ever reclaim the
+	 * chunk.
+	 */
+	rmr_req_sync_failed(parent_req);
 	return 0;
 }
 
 static void __release_parent_req(struct rcu_head *head)
 {
 	struct rmr_srv_req *req = container_of(head, struct rmr_srv_req, rcu);
+	struct rmr_srv_pool *srv_pool = req->srv_pool;
 	struct rmr_map_entry *entry = req->priv;
+	bool from_sync = req->from_sync;
 
 	pr_debug("is called for req=%p id=(%llu,%llu) err=%d, entry=%p\n",
 		 req, req->id.a, req->id.b, req->err, entry);
 
-	kfree(req->data);
-
-	//may be now we can stop saving entry in req->priv, but always rmr_map_find it
-	if (!req->err) {
-		pr_debug("req %p, completed all sync req, lets clean map\n", req);
-		rmr_process_wait_list(entry, 0);
-	} else {
-		pr_debug("req %p completed with err %d, process wait list\n",
-			 req, req->err);
-
-		/* sync of this entry failed, we reset the sync_cnt so that the other req
-		 * or sync thread could try again in the future. Without resetting, no one
-		 * could get the ref and start sync again.
+	if (req->keep_entry) {
+		/*
+		 * The sync failed or did not converge, which includes a
+		 * re-dirty or reset of this node's own map that dropped the
+		 * slot it walked. Reset sync_cnt so a later req or the sync
+		 * thread can claim the chunk again, and leave the entry for it
+		 * to find, unless a reset already dropped it from the index.
 		 */
 		atomic_set(&entry->sync_cnt, -1);
 		rmr_process_wait_list(entry, req->err);
+	} else {
+		pr_debug("req %p, completed all sync req, lets clean map\n", req);
+		rmr_process_wait_list(entry, 0);
+		pr_debug("free entry %p for req %p\n", entry, req);
+		kmem_cache_free(rmr_map_entry_cachep, entry);
 	}
 
-	pr_debug("free entry %p for req %p\n", entry, req);
-	kmem_cache_free(rmr_map_entry_cachep, entry);
-
-	if (req->from_sync)
-		rmr_srv_put_sync_permit(req->srv_pool);
-
 	kmem_cache_free(rmr_req_cachep, req);
+
+	/* Last: once the sync thread sees the count drop, the pool can go. */
+	if (from_sync)
+		rmr_srv_put_sync_parent(srv_pool);
 }
 
-static void rmr_req_sync_complete(struct rmr_srv_req *req)
+/**
+ * rmr_req_sync_release() - hand a finished parent sync req to its RCU release.
+ *
+ * @req:	the parent sync request.
+ * @free_entry:	true once the chunk is clean and the entry can be reclaimed.
+ */
+static void rmr_req_sync_release(struct rmr_srv_req *req, bool free_entry)
+{
+	req->keep_entry = !free_entry;
+	call_rcu(&req->rcu, __release_parent_req);
+}
+
+/**
+ * rmr_req_sync_converged() - decide whether the chunk is now fully in sync and
+ * commit that decision to the local map.
+ *
+ * @req:	the parent sync request.
+ *
+ * Description:
+ *	Only reaches the verdict and records it in this node's map. On the
+ *	clean verdict the coarse dirty bit is cleared and the entry erased;
+ *	otherwise the map is left as it is. Kicking the wait_list and
+ *	releasing the sync claim are left to rmr_req_sync_release().
+ *
+ * Return:
+ *	true if the chunk converged. false if it did not, or if this node's
+ *	map is gone, which also sets @req->err.
+ */
+static bool rmr_req_sync_converged(struct rmr_srv_req *req)
 {
 	struct rmr_srv_pool *srv_pool = req->srv_pool;
 	struct rmr_dirty_id_map *map;
+	bool converged = true;
 	int lock_idx;
 
+	/*
+	 * rmr_pool_find_map() returns the pointer unprotected, and the map page
+	 * is freed once synchronize_srcu(&pool->map_srcu) has passed, without
+	 * waiting on pool->ids_inflight_ref. Hold map_srcu from the lookup
+	 * until the last dereference below.
+	 */
+	lock_idx = srcu_read_lock(&srv_pool->pool->map_srcu);
+	map = rmr_pool_find_map(srv_pool->pool, srv_pool->member_id);
+	if (WARN(!map, "%s: no map for pool_id %u\n", __func__,
+		 srv_pool->member_id)) {
+		req->err = -EINVAL;
+		converged = false;
+		goto unlock;
+	}
+
+	/*
+	 * A chunk that did not converge has sub-blocks still dirty, or a
+	 * re-dirty or reset of this node's own map dropped the slot. The
+	 * release only resets the claim and kicks parked reqs; it does not
+	 * queue another sync.
+	 */
+	switch (rmr_subblk_take_if_clean(map, req->id.b)) {
+	case RMR_SUBBLK_CLEAN_TAKEN:
+		/* The dirty bit went with the slot; only the entry is left. */
+		rmr_map_erase_entry(map, req->id);
+		break;
+	case RMR_SUBBLK_PARTIAL:
+		converged = false;
+		break;
+	case RMR_SUBBLK_ABSENT:
+		/*
+		 * No slot at completion means the chunk converged only if none
+		 * existed when the transfer started. A slot dropped mid-sync
+		 * means this node's own map was marked dirty again or reset,
+		 * and the verdict leaves the map as that left it.
+		 */
+		if (req->had_slot)
+			converged = false;
+		else
+			rmr_map_unset_dirty(map, req->id, MAP_NO_FILTER);
+		break;
+	}
+
+unlock:
+	srcu_read_unlock(&srv_pool->pool->map_srcu, lock_idx);
+
+	return converged;
+}
+
+/**
+ * rmr_req_sync_complete() - finalize a sync parent or child request.
+ *
+ * @req:	the sync request; req->parent is NULL for the parent.
+ *
+ * Description:
+ *	Child reqs only put the permit and free. A parent reaches the chunk
+ *	verdict first and only then, on a clean verdict, sends MAP_CLEAR:
+ *	MAP_CLEAR asserts to every peer that this node holds the whole chunk
+ *	again, so it must not go out while sub-blocks are still dirty. The req
+ *	and the entry are released once that message completes.
+ */
+static void rmr_req_sync_complete(struct rmr_srv_req *req)
+{
 	pr_debug("sync_req %p completed for id (%llu, %llu), offset %llu, len %u, err %d, from sync %d\n",
 		 req, req->id.a, req->id.b, req->offset, req->length,
 		 req->err, req->from_sync);
@@ -640,36 +809,32 @@ static void rmr_req_sync_complete(struct rmr_srv_req *req)
 
 	pr_debug("release sync req %p, flags %u\n", req, req->flags);
 
-	/*
-	 * Only parent sync req own the allocated data.
-	 */
-	if (!req->parent) {
-		if (!req->err) {
-			map = rmr_pool_find_map(srv_pool->pool,
-						srv_pool->member_id);
-			if (map) {
-				lock_idx = srcu_read_lock(&srv_pool->pool->map_srcu);
-				rmr_map_unset_dirty(map, req->id,
-						    MAP_NO_FILTER);
-				srcu_read_unlock(&srv_pool->pool->map_srcu, lock_idx);
-			} else {
-				pr_err("no map found for pool_id %u\n", srv_pool->member_id);
-				req->err = -EINVAL;
-			}
-		}
-
-		pr_debug("req %p, completed all sync req, lets clean map\n",
-			 req);
-		call_rcu(&req->rcu, __release_parent_req);
-	} else {
-		/*
-		 * Child req has nothing to do but put permit and free
-		 */
+	if (req->parent) {
 		if (req->from_sync)
 			rmr_srv_put_sync_permit(req->srv_pool);
-
 		kmem_cache_free(rmr_req_cachep, req);
+		return;
 	}
+
+	/*
+	 * Every child is done with the buffer, and neither the verdict nor
+	 * MAP_CLEAR reads it. Parents take no permit, so freeing it here
+	 * limits chunk buffers to the syncs still transferring.
+	 */
+	kfree(req->data);
+	req->data = NULL;
+
+	/*
+	 * A failed or unconverged sync leaves the entry in the xarray, unless a
+	 * map reset dropped it, so a later req or the sync thread can claim the
+	 * chunk; the kick reports the error so parked reqs do not deadlock.
+	 */
+	if (req->err || !rmr_req_sync_converged(req)) {
+		rmr_req_sync_release(req, false);
+		return;
+	}
+
+	rmr_req_send_map_clear(req);
 }
 
 static void rmr_req_sync_failed(struct rmr_srv_req *req)
@@ -696,7 +861,58 @@ static void rmr_req_map_clear_done(void *priv, int err)
 		pr_err("pool %s, sync req  with id (%llu, %llu) failed to send map clear\n",
 		       req->srv_pool->pool->poolname, req->id.a, req->id.b);
 
-	rmr_req_sync_complete(req);
+	/*
+	 * The chunk was declared clean locally before this went out. A send
+	 * error only leaves a zombie entry on the peer, which
+	 * rmr_srv_check_map_clear() reaps.
+	 */
+	rmr_req_sync_release(req, true);
+}
+
+/*
+ * A sync child stored its slice of the chunk. Mark the sub-blocks the slice
+ * fully covers in sync.
+ */
+static void rmr_req_mark_slice_in_sync(struct rmr_srv_req *req)
+{
+	struct rmr_srv_pool *srv_pool = req->srv_pool;
+	struct rmr_dirty_id_map *map;
+	struct rmr_subblk_slot *slot;
+	u32 first, count;
+	int lock_idx;
+
+	count = rmr_subblk_covered(srv_pool->pool->chunk_size_shift,
+				   req->offset, req->length, &first);
+	if (!count)
+		return;
+
+	/*
+	 * rmr_pool_find_map() drops its own read section before returning,
+	 * and rmr_pool_remove_map() frees the map page once
+	 * synchronize_srcu(&pool->map_srcu) has passed. Hold map_srcu across
+	 * the lookup and every dereference of the map, or the page can go
+	 * away under us.
+	 */
+	lock_idx = srcu_read_lock(&srv_pool->pool->map_srcu);
+	map = rmr_pool_find_map(srv_pool->pool, srv_pool->member_id);
+	if (WARN_ON_ONCE(!map))
+		goto unlock;
+
+	/*
+	 * Refine an existing record only. Creating one here would turn a
+	 * chunk the cache describes as fully dirty into a partial one while
+	 * its own whole-chunk sync is still running, and a GFP_NOWAIT failure
+	 * for one child would leave that child's run dirty on a slot a sibling
+	 * created, costing a second transfer of a chunk that was in fact
+	 * fully written.
+	 */
+	rcu_read_lock();
+	slot = rmr_subblk_lookup(map, req->id.b);
+	if (slot)
+		rmr_subblk_slot_clear(slot, first, count);
+	rcu_read_unlock();
+unlock:
+	srcu_read_unlock(&srv_pool->pool->map_srcu, lock_idx);
 }
 
 static void rmr_req_store_done(struct rmr_srv_req *req)
@@ -714,6 +930,8 @@ static void rmr_req_store_done(struct rmr_srv_req *req)
 
 	if (req->err)
 		parent_req->err = req->err;
+	else if (req->parent)
+		rmr_req_mark_slice_in_sync(req);
 
 	if (map_entry_put_sync(entry)) {
 		pr_debug("%s: for entry %p id (%llu, %llu) all sync req done.\n", __func__,
@@ -743,7 +961,6 @@ static void rmr_req_send_map_clear(struct rmr_srv_req *req)
 	if (!pool) {
 		pr_err("Cannot send map clear. No pool client assigend for srv pool %s\n",
 		       req->srv_pool->pool->poolname);
-		req->err = -EINVAL;
 		goto err;
 	}
 
@@ -793,5 +1010,5 @@ static void rmr_req_send_map_clear(struct rmr_srv_req *req)
 	return;
 
 err:
-	rmr_req_sync_complete(req);
+	rmr_req_sync_release(req, true);
 }

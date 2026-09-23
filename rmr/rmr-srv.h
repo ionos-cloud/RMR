@@ -63,6 +63,12 @@ struct rmr_srv_pool {
 	struct task_struct	*th_tsk;
 	atomic_t		thread_state;
 	atomic_t		in_flight_sync_reqs;
+	/*
+	 * Background parent syncs not yet released. A parent holds no permit,
+	 * but still sends MAP_CLEAR and releases its chunk after the last
+	 * child, so the sync thread waits for these before reporting Stopped.
+	 */
+	atomic_t		sync_parents;
 
 	struct rmr_srv_io_store	*io_store;
 	struct mutex		srv_pool_lock;
@@ -183,6 +189,7 @@ void rmr_srv_stop_sync_and_go_offline(struct rmr_pool *pool);
 
 int rmr_srv_get_sync_permit(struct rmr_srv_pool *srv_pool);
 void rmr_srv_put_sync_permit(struct rmr_srv_pool *srv_pool);
+void rmr_srv_put_sync_parent(struct rmr_srv_pool *srv_pool);
 
 int rmr_srv_sync_thread_start(struct rmr_srv_pool *srv_pool);
 int rmr_srv_sync_thread_stop(struct rmr_srv_pool *srv_pool);

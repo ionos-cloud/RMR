@@ -760,6 +760,26 @@ inline struct rmr_map_entry *rmr_map_unset_dirty(struct rmr_dirty_id_map *map, r
 	return entry;
 }
 
+/**
+ * rmr_map_erase_entry() - drop a chunk's entry and leave its dirty bit alone.
+ *
+ * @map:	map to work on.
+ * @id:		the chunk.
+ *
+ * Description:
+ *	For a caller that took the chunk clean with rmr_subblk_take_if_clean(),
+ *	which already cleared the bit. Clearing it again could erase a re-dirty
+ *	that landed since.
+ */
+void rmr_map_erase_entry(struct rmr_dirty_id_map *map, rmr_id_t id)
+{
+	unsigned long flags;
+
+	xa_lock_irqsave(&map->rmr_id_map, flags);
+	__xa_erase(&map->rmr_id_map, rmr_id_to_key(id));
+	xa_unlock_irqrestore(&map->rmr_id_map, flags);
+}
+
 /*
  * rmr_map_check_dirty - Check if the following bits are set or not
  *
