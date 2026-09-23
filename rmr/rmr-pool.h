@@ -99,7 +99,17 @@ struct rmr_pool {
 
 	bool is_clt;
 	bool sync;
+
+	/*
+	 * Per-map sub-block slot cache cap in KiB, applied to every
+	 * map of this pool.
+	 */
+	u32			subblk_cache_kb;
+	/* @subblk_cache_kb as a slot count; see rmr_subblk_kb_to_slots(). */
+	u32			subblk_slots_max;
 };
+
+#define RMR_SUBBLK_CACHE_KB_DEFAULT	16384	/* 16 MiB of slots per map */
 
 /**
  * rmr_pool_find_md - find the index of the srv_md with the provided key in the pool_md

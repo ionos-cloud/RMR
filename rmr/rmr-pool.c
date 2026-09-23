@@ -171,6 +171,8 @@ static struct rmr_pool *alloc_pool(const char *poolname, u32 group_id)
 	pool->group_id = group_id;
 	pool->map_ver = 1;
 	pool->mapped_size = 0;
+	pool->subblk_cache_kb = RMR_SUBBLK_CACHE_KB_DEFAULT;
+	pool->subblk_slots_max = rmr_subblk_kb_to_slots(pool->subblk_cache_kb);
 	xa_init_flags(&pool->stg_members, XA_FLAGS_ALLOC);
 	init_completion(&pool->complete_done);
 	init_completion(&pool->confirm_done);

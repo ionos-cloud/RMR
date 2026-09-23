@@ -177,6 +177,9 @@ struct rmr_dirty_id_map *rmr_map_create(struct rmr_pool *pool, u8 member_id)
 	}
 
 	xa_init_flags(&map->rmr_id_map, XA_FLAGS_ALLOC);
+	xa_init(&map->subblk_cache);
+	spin_lock_init(&map->subblk_cache_lock);
+	map->pool = pool;
 	map->member_id = member_id;
 	map->ts = jiffies;
 
@@ -200,9 +203,11 @@ void rmr_map_destroy(struct rmr_dirty_id_map *map)
 	u64 no_of_slps;
 
 	WARN_ON(!xa_empty(&map->rmr_id_map));
+	WARN_ON(!xa_empty(&map->subblk_cache));
 	map->ts = jiffies;
 
 	pr_info("%s: member_id %u\n", __func__, map->member_id);
+	xa_destroy(&map->subblk_cache);
 	kfree(map->bitmap_filter);
 
 	for (i = 0; i < map->no_of_flp; i++) {

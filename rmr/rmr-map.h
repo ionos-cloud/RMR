@@ -166,11 +166,14 @@ enum rmr_map_state {
 	// do we have some other useful states ?
 };
 
+struct rmr_pool;
+
 struct rmr_dirty_id_map {
 	u8 member_id;
 	struct xarray rmr_id_map;
 	unsigned long ts;
 	atomic_t check_state;
+	struct rmr_pool *pool;
 
 	/*
 	 * The usage of this is restricted to form a linked lised
@@ -190,6 +193,15 @@ struct rmr_dirty_id_map {
 	u64		total_slp;
 	u8		*bitmap_filter;
 	void		*dirty_bitmap[MAX_NO_OF_FLP];
+
+	/*
+	 * Bounded sub-block slot cache. Holds a slot keyed by chunk id. Slots
+	 * are allocated lazily on partial events; the cap is enforced by
+	 * refusing new ones.
+	 */
+	struct xarray	subblk_cache;
+	spinlock_t	subblk_cache_lock;	/* serializes cache mutations */
+	u32		subblk_nr;		/* slots currently cached */
 };
 
 /*
@@ -208,6 +220,32 @@ struct rmr_subblk_slot {
 	DECLARE_BITMAP(bits, RMR_MAX_SUBBLK);
 	struct rcu_head rcu;
 };
+
+/**
+ * rmr_subblk_kb_to_slots() - how many slots a cap of @kb KiB holds.
+ *
+ * @kb:	the per-map cache cap in KiB.
+ *
+ * Description:
+ *	The cap is configured in KiB but enforced as a slot count, so the
+ *	admission path compares counts instead of recomputing a byte budget. A
+ *	slot is counted at the size of the kmalloc bucket it comes from, so the
+ *	KiB value matches the memory the slots themselves take. The xarray
+ *	nodes that index them are not counted, and with cached chunks far apart
+ *	each slot can need a leaf node of its own, several times the size of a
+ *	slot.
+ *
+ * Return:
+ *	the slot count, never 0. A cap of no slots would refuse every chunk a
+ *	refinement and defeat the cache.
+ */
+static inline u32 rmr_subblk_kb_to_slots(u32 kb)
+{
+	u64 slots = ((u64)kb << 10) /
+		    kmalloc_size_roundup(sizeof(struct rmr_subblk_slot));
+
+	return max_t(u32, 1, slots);
+}
 
 struct rmr_map_entry {
 	atomic_t sync_cnt;
