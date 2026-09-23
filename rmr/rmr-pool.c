@@ -425,6 +425,19 @@ int rmr_pool_save_map(struct rmr_pool *pool, void *buf, size_t buflen,
 	pr_info("%s: buf_size %u, buflen w/o hdr %lu\n", __func__, map_buf_hdr->buf_size, buflen);
 
 	/*
+	 * A non-test save overwrites the dirty bitmap with a peer's
+	 * view. Any cached sub-block refinement is now invalid because
+	 * slots from before the gap cannot claim sub-blocks are clean
+	 * against post-gap peer state. Drain before the overwrite, not
+	 * after, so a sync snapshot or a clean verdict taken against the
+	 * new bitmap cannot trust a stale slot's in-sync bits. A chunk
+	 * without a slot is synced whole until a fast-path write gives it
+	 * a new one.
+	 */
+	if (!test_only)
+		rmr_subblk_drain_all(map);
+
+	/*
 	 * The buf_size would be a factor of PAGE_SIZE,
 	 * and thats how we know no_of_slp(s) to save.
 	 */

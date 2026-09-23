@@ -253,6 +253,31 @@ struct rmr_map_entry {
 };
 
 /*
+ * Bounded sub-block slot cache.
+ */
+struct rmr_subblk_slot *rmr_subblk_lookup(struct rmr_dirty_id_map *map,
+					  u64 chunk);
+struct rmr_subblk_slot *rmr_subblk_get_cached(struct rmr_dirty_id_map *map,
+					      u64 chunk);
+void rmr_subblk_drain_all(struct rmr_dirty_id_map *map);
+
+/*
+ * Outcome of classifying a chunk's cached refinement. CLEAN_TAKEN is handed
+ * to exactly one caller, which owns the chunk's transition out of PARTIAL.
+ */
+enum rmr_subblk_state {
+	RMR_SUBBLK_ABSENT = 0,	/* no slot cached for the chunk */
+	RMR_SUBBLK_PARTIAL,	/* slot cached, some sub-blocks still dirty */
+	RMR_SUBBLK_CLEAN_TAKEN,	/* all in sync; slot erased, dirty bit cleared */
+};
+
+enum rmr_subblk_state rmr_subblk_take_if_clean(struct rmr_dirty_id_map *map,
+					       u64 chunk);
+
+bool rmr_subblk_snapshot_bits(struct rmr_dirty_id_map *map, u64 chunk,
+			      unsigned long *dst_bits, u32 *nr_subblk);
+
+/*
  * The header of the bitmap buffer.
  */
 struct rmr_map_cbuf_hdr {
