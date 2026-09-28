@@ -144,6 +144,8 @@ struct rmr_iu {
 	struct rmr_msg_io	msg;
 	int			errno;
 	atomic_t		succeeded;
+	/* succeeded legs holding the whole chunk */
+	atomic_t		full;
 	refcount_t		refcount;
 	rmr_conf_fn		*conf;
 	void			*priv;

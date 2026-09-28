@@ -615,6 +615,45 @@ enum rmr_subblk_state rmr_subblk_take_if_clean(struct rmr_dirty_id_map *map,
 }
 
 /**
+ * rmr_subblk_undo() - mark an undone write's sub-blocks as needing sync again.
+ *
+ * @map:	this node's own map.
+ * @chunk:	id.b of the chunk.
+ * @first:	index of the first sub-block the write touched.
+ * @count:	number of sub-blocks it touched.
+ *
+ * Description:
+ *	With a slot, the write's sub-blocks are marked dirty again, so they are
+ *	re-pulled like any other stale sub-block. Without one, the chunk is
+ *	either dirty as a whole and re-pulled anyway, or clean. A clean chunk
+ *	cannot be undone here, since this node may have finished it after
+ *	storing the write, so the write is kept. The check and the update
+ *	share subblk_cache_lock with rmr_subblk_take_if_clean(), so a clean
+ *	verdict cannot erase the slot in between.
+ *
+ * Return:
+ *	true if the chunk is clean here and the write was kept.
+ */
+bool rmr_subblk_undo(struct rmr_dirty_id_map *map, u64 chunk, u32 first,
+		     u32 count)
+{
+	rmr_id_t id = { .a = 1, .b = chunk };
+	struct rmr_subblk_slot *s;
+	unsigned long flags;
+	bool kept = false;
+
+	spin_lock_irqsave(&map->subblk_cache_lock, flags);
+	s = xa_load(&map->subblk_cache, chunk);
+	if (s)
+		rmr_subblk_slot_set_dirty(s, first, count);
+	else
+		kept = !rmr_map_check_dirty(map, id);
+	spin_unlock_irqrestore(&map->subblk_cache_lock, flags);
+
+	return kept;
+}
+
+/**
  * rmr_map_set_dirty -	Set bits from rmr_id_t
  *
  * @map:		Map to work on
@@ -800,7 +839,7 @@ inline bool rmr_map_check_dirty(struct rmr_dirty_id_map *map, rmr_id_t id)
 }
 
 /**
- * rmr_map_get_dirty_entry - Check and return entry if the following bits are set
+ * rmr_map_find_dirty_entry - Look up the entry of a dirty chunk
  *
  * @map:		Map to work on
  * @id:			rmr_id_t containing the chunk info
@@ -808,48 +847,126 @@ inline bool rmr_map_check_dirty(struct rmr_dirty_id_map *map, rmr_id_t id)
  *			id.a: Number of chunks dirty starting (and including) id.b
  *
  * Description:
- *	Check if a chunk is dirty or not.
- *	If the particular chunk is dirty, then create an entry for it and return back.
+ *	Pure lookup: does not allocate and leaves the caller's RCU read
+ *	section alone, so a caller may keep other RCU-protected pointers
+ *	live across it. A dirty chunk with no entry yet is reported
+ *	separately, because only rmr_map_create_dirty_entry() can supply one
+ *	and it must run outside the read section.
  *
  * Context:
- *	srcu pool->map_srcu should be held while calling this function.
+ *	Call with rcu_read_lock() held; it keeps the returned entry alive
+ *	against a concurrent call_rcu() free. The caller keeps @map valid,
+ *	since rmr_pool_find_map() returns it unprotected.
+ *
+ * Return:
+ *	the entry when the chunk is dirty and has one;
+ *	NULL when the chunk is clean;
+ *	ERR_PTR(-ENOENT) when the chunk is dirty but has no entry yet.
  */
-inline struct rmr_map_entry *rmr_map_get_dirty_entry(struct rmr_dirty_id_map *map, rmr_id_t id)
+inline struct rmr_map_entry *rmr_map_find_dirty_entry(struct rmr_dirty_id_map *map, rmr_id_t id)
+{
+	struct rmr_map_entry *entry;
+
+	if (!rmr_map_check_dirty(map, id))
+		return NULL;
+
+	entry = xa_load(&map->rmr_id_map, rmr_id_to_key(id));
+	if (!entry) {
+		pr_debug("%s: For id [%llu, %llu], no entry yet, member_id %u\n",
+			 __func__, id.a, id.b, map->member_id);
+		return ERR_PTR(-ENOENT);
+	}
+
+	pr_debug("%s: For id [%llu, %llu], entry exists member_id %u\n",
+		 __func__, id.a, id.b, map->member_id);
+
+	return entry;
+}
+
+/**
+ * rmr_map_create_dirty_entry - Install an entry for a dirty chunk
+ *
+ * @map:		Map to work on
+ * @id:			rmr_id_t containing the chunk info
+ *			id.b: chunk number denoted by this entry
+ *			id.a: Number of chunks dirty starting (and including) id.b
+ *
+ * Description:
+ *	Idempotent: losing the insert race counts as success, since the
+ *	winner's entry is the one every subsequent lookup finds. Does not
+ *	return the entry, because nothing keeps it alive once the caller
+ *	re-enters its read section; the caller re-runs
+ *	rmr_map_find_dirty_entry() for that.
+ *
+ * Context:
+ *	Sleeps. Call without rcu_read_lock() held.
+ *
+ * Return:
+ *	0 once an entry exists for @id, negative errno on allocation failure.
+ */
+int rmr_map_create_dirty_entry(struct rmr_dirty_id_map *map, rmr_id_t id)
 {
 	struct rmr_map_entry *entry;
 	int err;
 
-	if (rmr_map_check_dirty(map, id)) {
-		entry = xa_load(&map->rmr_id_map, rmr_id_to_key(id));
-		if (entry) {
-			pr_debug("%s: For id [%llu, %llu], entry exists member_id %u\n",
-				 __func__, id.a, id.b, map->member_id);
-			return entry;
-		}
-
-		entry = kmem_cache_zalloc(rmr_map_entry_cachep, GFP_KERNEL);
-		if (!entry) {
-			pr_err("%s: Cannot allocate entry for member_id %d, id [[%llu, %llu]]\n",
-			       __func__, map->member_id, id.a, id.b);
-			return ERR_PTR(-ENOMEM);
-		}
-
-		atomic_set(&entry->sync_cnt, -1);
-		init_llist_head(&entry->wait_list);
-
-		err = xa_insert_irq(&map->rmr_id_map, rmr_id_to_key(id), entry, GFP_KERNEL);
-		if (err == 0)
-			return entry;
-
-		kmem_cache_free(rmr_map_entry_cachep, entry);
-
-		if (err == -EBUSY)
-			return xa_load(&map->rmr_id_map, rmr_id_to_key(id));
-		else
-			return ERR_PTR(-ENOMEM);
+	entry = kmem_cache_zalloc(rmr_map_entry_cachep, GFP_KERNEL);
+	if (!entry) {
+		pr_err("%s: Cannot allocate entry for member_id %d, id [[%llu, %llu]]\n",
+		       __func__, map->member_id, id.a, id.b);
+		return -ENOMEM;
 	}
 
-	return NULL;
+	atomic_set(&entry->sync_cnt, -1);
+	init_llist_head(&entry->wait_list);
+
+	err = xa_insert_irq(&map->rmr_id_map, rmr_id_to_key(id), entry, GFP_KERNEL);
+	if (err)
+		kmem_cache_free(rmr_map_entry_cachep, entry);
+
+	/* Losing the race to another caller still leaves an entry for @id. */
+	return err == -EBUSY ? 0 : err;
+}
+
+/**
+ * rmr_map_get_dirty_entry_rcu - Look up the entry of a dirty chunk, creating it if missing
+ *
+ * @map:		Map to work on
+ * @id:			rmr_id_t containing the chunk info
+ *			id.b: chunk number denoted by this entry
+ *			id.a: Number of chunks dirty starting (and including) id.b
+ *
+ * Description:
+ *	Creating an entry sleeps, so on a miss the read section is left for
+ *	rmr_map_create_dirty_entry() and the lookup is redone once it is
+ *	retaken. Nothing found before the gap is carried across it. Another
+ *	pass is only needed if the chunk was cleaned and re-dirtied
+ *	meanwhile, which is progress elsewhere rather than a spin.
+ *
+ * Context:
+ *	Call with rcu_read_lock() held; it may be dropped and retaken, so the
+ *	caller must not hold other RCU-protected pointers across this call.
+ *	Returns with rcu_read_lock() held. The caller keeps @map valid, since
+ *	rmr_pool_find_map() returns it unprotected.
+ *
+ * Return:
+ *	the entry when the chunk is dirty, valid for the caller's read section;
+ *	NULL when the chunk is clean;
+ *	ERR_PTR() on allocation failure.
+ */
+struct rmr_map_entry *rmr_map_get_dirty_entry_rcu(struct rmr_dirty_id_map *map, rmr_id_t id)
+{
+	struct rmr_map_entry *entry;
+	int err;
+
+	while (IS_ERR(entry = rmr_map_find_dirty_entry(map, id))) {
+		rcu_read_unlock();
+		err = rmr_map_create_dirty_entry(map, id);
+		rcu_read_lock();
+		if (err)
+			return ERR_PTR(err);
+	}
+
+	return entry;
 }
 
 /**

@@ -10,6 +10,7 @@
 
 /* rmr-srv-sysfs.c */
 
+#include <linux/kfifo.h>
 #include <linux/types.h>
 #include <linux/idr.h>
 #include <linux/kref.h>
@@ -69,6 +70,14 @@ struct rmr_srv_pool {
 	 * child, so the sync thread waits for these before reporting Stopped.
 	 */
 	atomic_t		sync_parents;
+	/*
+	 * Chunks the background sync is waiting on. It parks a waiter on each
+	 * chunk it syncs or finds claimed, and whoever holds the chunk hands the
+	 * waiter back on sync_ready when it lets go. The sync thread syncs what
+	 * is still dirty, and does not report Stopped while a waiter is out.
+	 */
+	atomic_t		sync_waiters;
+	struct llist_head	sync_ready;
 
 	struct rmr_srv_io_store	*io_store;
 	struct mutex		srv_pool_lock;
@@ -93,6 +102,18 @@ struct rmr_srv_pool {
 	u32			max_sync_io_size;
 	struct workqueue_struct *clean_wq;
 	struct delayed_work	clean_dwork;
+
+	/*
+	 * Chunks this node took clean on the write fast-path and still owes its
+	 * peers a MAP_CLEAR for. That completion runs where it cannot sleep and
+	 * the send can, so the chunk ids are handed to a worker. Bounded and
+	 * best-effort: a dropped id leaves a peer believing this node is still
+	 * behind for the chunk, which is the safe direction and is reconciled
+	 * by rmr_srv_check_map_clear().
+	 */
+	spinlock_t		mapclear_lock;
+	DECLARE_KFIFO_PTR(mapclear_fifo, u64);
+	struct work_struct	mapclear_work;
 
 	struct workqueue_struct *md_sync_wq;
 	struct delayed_work	md_sync_dwork;
@@ -190,6 +211,11 @@ void rmr_srv_stop_sync_and_go_offline(struct rmr_pool *pool);
 int rmr_srv_get_sync_permit(struct rmr_srv_pool *srv_pool);
 void rmr_srv_put_sync_permit(struct rmr_srv_pool *srv_pool);
 void rmr_srv_put_sync_parent(struct rmr_srv_pool *srv_pool);
+void rmr_srv_sync_waiter_ready(struct rmr_srv_req *req);
+
+void rmr_srv_mapclear_queue(struct rmr_srv_pool *srv_pool, u64 chunk);
+void rmr_srv_fill_map_clear(struct rmr_iu *iu, struct rmr_pool *clt,
+			    u8 member_id, rmr_id_t id);
 
 int rmr_srv_sync_thread_start(struct rmr_srv_pool *srv_pool);
 int rmr_srv_sync_thread_stop(struct rmr_srv_pool *srv_pool);

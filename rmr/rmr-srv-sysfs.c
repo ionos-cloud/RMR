@@ -320,6 +320,8 @@ static ssize_t rmr_srv_add_clt_pool_store(struct kobject *kobj,
 
 close_clt:
 	srv_pool->clt = NULL;
+	/* A map-clear worker that already read the pointer may still use it. */
+	flush_work(&srv_pool->mapclear_work);
 	srv_pool->max_sync_io_size = 0;
 close_rmr:
 	pr_err("%s: Adding client pool failed\n", __func__);

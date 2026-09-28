@@ -81,6 +81,20 @@ void rmr_put_srv_pool(struct rmr_srv_pool *srv_pool)
 	if (refcount_dec_and_test(&srv_pool->refcount)) {
 		mutex_destroy(&srv_pool->srv_pool_lock);
 
+		/*
+		 * Take the workers down before the pools they dereference.
+		 * rmr_srv_check_map_clear() and rmr_srv_mapclear_work() both
+		 * read srv_pool->clt and srv_pool->pool.
+		 * cancel_delayed_work_sync() stops the periodic check even
+		 * though it re-arms itself, and destroying clean_wq drains any
+		 * queued map clear work.
+		 */
+		cancel_delayed_work_sync(&srv_pool->md_sync_dwork);
+		destroy_workqueue(srv_pool->md_sync_wq);
+
+		cancel_delayed_work_sync(&srv_pool->clean_dwork);
+		destroy_workqueue(srv_pool->clean_wq);
+
 		if (srv_pool->clt)
 			rmr_clt_close(srv_pool->clt);
 
@@ -94,11 +108,7 @@ void rmr_put_srv_pool(struct rmr_srv_pool *srv_pool)
 			free_pool(pool);
 		}
 
-		cancel_delayed_work_sync(&srv_pool->md_sync_dwork);
-		destroy_workqueue(srv_pool->md_sync_wq);
-
-		cancel_delayed_work_sync(&srv_pool->clean_dwork);
-		destroy_workqueue(srv_pool->clean_wq);
+		kfifo_free(&srv_pool->mapclear_fifo);
 
 		kfree(srv_pool);
 	}
@@ -428,6 +438,127 @@ out:
 			   msecs_to_jiffies(RMR_SRV_CHECK_MAPS_INTERVAL_MS));
 }
 
+/*
+ * Fill @iu as a MAP_CLEAR that tells the peers in @clt that @member_id holds
+ * chunk @id again.
+ */
+void rmr_srv_fill_map_clear(struct rmr_iu *iu, struct rmr_pool *clt,
+			    u8 member_id, rmr_id_t id)
+{
+	iu->msg.hdr.group_id = cpu_to_le32(clt->group_id);
+	iu->msg.hdr.type = cpu_to_le16(RMR_MSG_MAP_CLEAR);
+	iu->msg.hdr.__padding = 0;
+
+	iu->msg.id_a = cpu_to_le64(id.a);
+	iu->msg.id_b = cpu_to_le64(id.b);
+	iu->msg.member_id = member_id;
+	iu->msg.flags = cpu_to_le32(RMR_OP_WRITE);
+}
+
+/*
+ * Completion for a MAP_CLEAR the fast path owed its peers. Nothing to settle
+ * beyond the iu: the chunk was taken clean locally before it was queued.
+ */
+static void rmr_srv_mapclear_done(void *priv, int err)
+{
+	struct rmr_iu *iu = priv;
+
+	rmr_clt_put_iu(iu->pool, iu);
+}
+
+/**
+ * rmr_srv_mapclear_queue() - owe the peers a MAP_CLEAR for @chunk.
+ *
+ * @srv_pool:	the server pool that took the chunk clean.
+ * @chunk:	id.b of the chunk.
+ *
+ * Description:
+ *	The send itself may sleep, so it is left to rmr_srv_mapclear_work().
+ *	A full fifo drops the id, which leaves the peers believing this node is
+ *	still behind for the chunk until rmr_srv_check_map_clear() reconciles
+ *	it.
+ *
+ * Context:
+ *	Any context.
+ */
+void rmr_srv_mapclear_queue(struct rmr_srv_pool *srv_pool, u64 chunk)
+{
+	if (!kfifo_in_spinlocked(&srv_pool->mapclear_fifo, &chunk, 1,
+				 &srv_pool->mapclear_lock)) {
+		pr_debug("pool %s map clear fifo full, dropping chunk %llu\n",
+			 srv_pool->pool->poolname, chunk);
+		return;
+	}
+
+	queue_work(srv_pool->clean_wq, &srv_pool->mapclear_work);
+}
+
+/**
+ * rmr_srv_mapclear_work() - tell the peers about chunks taken clean locally.
+ *
+ * @work:	the pool's mapclear_work.
+ *
+ * Description:
+ *	Every other path that clears this node's own coarse dirty bit sends
+ *	MAP_CLEAR in the same breath, so the peers' copies of this node's map
+ *	track it. The write fast-path cannot, because it completes where it may
+ *	not sleep. It queues the chunk instead and this worker sends it.
+ */
+static void rmr_srv_mapclear_work(struct work_struct *work)
+{
+	struct rmr_srv_pool *srv_pool = container_of(work, struct rmr_srv_pool,
+						     mapclear_work);
+	struct rmr_pool *pool = srv_pool->clt;
+	unsigned long flags;
+	u64 chunk;
+
+	if (!pool) {
+		pr_debug("pool %s has no sync pool, cannot send map clear\n",
+			 srv_pool->pool->poolname);
+		/*
+		 * Drop the ids rather than send them once a sync pool is added,
+		 * when they may no longer be true. The peers' marks they leave
+		 * behind cost an extra resync, never a lost write.
+		 */
+		spin_lock_irqsave(&srv_pool->mapclear_lock, flags);
+		kfifo_reset(&srv_pool->mapclear_fifo);
+		spin_unlock_irqrestore(&srv_pool->mapclear_lock, flags);
+		return;
+	}
+
+	while (kfifo_out_spinlocked(&srv_pool->mapclear_fifo, &chunk, 1,
+				    &srv_pool->mapclear_lock)) {
+		rmr_id_t id = { .a = 1, .b = chunk };
+		struct rmr_iu *iu;
+		int err;
+
+		iu = rmr_clt_get_iu(pool, RMR_OP_WRITE, WAIT);
+		if (IS_ERR_OR_NULL(iu)) {
+			pr_err_ratelimited("pool %s no iu for map clear of chunk %llu\n",
+					   srv_pool->pool->poolname, chunk);
+			continue;
+		}
+
+		rmr_srv_fill_map_clear(iu, pool, srv_pool->member_id, id);
+
+		/*
+		 * rmr_clt_get_iu() does not set iu->pool - only
+		 * rmr_clt_request() does - and the completion has nothing but
+		 * the iu to find the pool it must put the reference to.
+		 */
+		iu->pool = pool;
+		iu->conf = rmr_srv_mapclear_done;
+		iu->priv = iu;
+
+		err = rmr_clt_send_map_update(pool, iu);
+		if (err) {
+			pr_err_ratelimited("pool %s map clear send for chunk %llu failed, err %d\n",
+					   srv_pool->pool->poolname, chunk, err);
+			rmr_clt_put_iu(pool, iu);
+		}
+	}
+}
+
 struct rmr_srv_pool *rmr_create_srv_pool(char *poolname, u32 member_id)
 {
 	struct rmr_srv_pool *srv_pool;
@@ -450,6 +581,8 @@ struct rmr_srv_pool *rmr_create_srv_pool(char *poolname, u32 member_id)
 	atomic_set(&srv_pool->thread_state, SYNC_THREAD_STOPPED);
 	atomic_set(&srv_pool->in_flight_sync_reqs, 0);
 	atomic_set(&srv_pool->sync_parents, 0);
+	atomic_set(&srv_pool->sync_waiters, 0);
+	init_llist_head(&srv_pool->sync_ready);
 
 	/* clean outdated entries from the map work */
 	srv_pool->clean_wq = alloc_workqueue("%s_clean_wq", 0, 0, poolname);
@@ -458,6 +591,18 @@ struct rmr_srv_pool *rmr_create_srv_pool(char *poolname, u32 member_id)
 		pr_err("failed to create wq pool %s\n", poolname);
 		return ERR_PTR(-ENOMEM);
 	}
+
+	spin_lock_init(&srv_pool->mapclear_lock);
+	if (kfifo_alloc(&srv_pool->mapclear_fifo, RMR_MAPCLEAR_FIFO_SIZE,
+			GFP_KERNEL)) {
+		pr_err("failed to allocate map clear fifo for pool %s\n",
+		       poolname);
+		destroy_workqueue(srv_pool->clean_wq);
+		kfree(srv_pool);
+		return ERR_PTR(-ENOMEM);
+	}
+
+	INIT_WORK(&srv_pool->mapclear_work, rmr_srv_mapclear_work);
 	INIT_DELAYED_WORK(&srv_pool->clean_dwork, rmr_srv_check_map_clear);
 	queue_delayed_work(srv_pool->clean_wq, &srv_pool->clean_dwork,
 			   msecs_to_jiffies(RMR_SRV_CHECK_MAPS_INTERVAL_MS));
@@ -465,6 +610,7 @@ struct rmr_srv_pool *rmr_create_srv_pool(char *poolname, u32 member_id)
 	/* sync metadata of the rmr pool */
 	srv_pool->md_sync_wq = alloc_workqueue("%s_md_sync_wq", 0, 0, poolname);
 	if (!srv_pool->md_sync_wq) {
+		kfifo_free(&srv_pool->mapclear_fifo);
 		kfree(srv_pool);
 		pr_err("failed to create md_sync_wq pool %s\n", poolname);
 		return ERR_PTR(-ENOMEM);
@@ -511,6 +657,55 @@ static void rmr_srv_sess_put_pool(struct rmr_pool *pool)
 	struct rmr_srv_pool *srv_pool = (struct rmr_srv_pool *)pool->priv;
 
 	rmr_put_srv_pool(srv_pool);
+}
+
+/**
+ * rmr_srv_undo_write() - undo a write the client could not ack.
+ *
+ * @srv_pool:	the server pool.
+ * @id:		the chunk id (id.a == 1).
+ * @offset:	byte offset of the write.
+ * @length:	byte length of the write.
+ *
+ * Description:
+ *	Marks the sub-blocks the write touched dirty again in this node's own
+ *	map, so the local backend stops presenting the un-acked data as in
+ *	sync and those sub-blocks are re-pulled from a peer that holds the
+ *	whole chunk. Sub-blocks kept in sync by earlier accepted writes are
+ *	left alone. A node whose chunk is already clean cannot undo the write
+ *	and keeps it.
+ *
+ * Return:
+ *	true if this node kept the write.
+ */
+static bool rmr_srv_undo_write(struct rmr_srv_pool *srv_pool, rmr_id_t id,
+			       u64 offset, u32 length)
+{
+	struct rmr_dirty_id_map *map;
+	bool kept = false;
+	u32 first, count;
+	int lock_idx;
+
+	if (id.a != 1)
+		return false;
+
+	count = rmr_subblk_touched(srv_pool->pool->chunk_size_shift,
+				   offset, length, &first);
+	if (!count)
+		return false;
+
+	/*
+	 * rmr_pool_find_map() returns the pointer with no protection, and the
+	 * map page is freed once synchronize_srcu(&pool->map_srcu) has passed,
+	 * so hold map_srcu across the lookup and the dereference.
+	 */
+	lock_idx = srcu_read_lock(&srv_pool->pool->map_srcu);
+	map = rmr_pool_find_map(srv_pool->pool, srv_pool->member_id);
+	if (map)
+		kept = rmr_subblk_undo(map, id.b, first, count);
+	srcu_read_unlock(&srv_pool->pool->map_srcu, lock_idx);
+
+	return kept;
 }
 
 /**
@@ -568,6 +763,8 @@ void rmr_srv_endreq(struct rmr_srv_req *req, int err)
 	}
 
 out:
+	if (!err && req->fast_partial)
+		err = RMR_IO_OK_PARTIAL;
 	/* The requests created by rmr-srv don't use rtrs_op. */
 	rtrs_srv_resp_rdma(rtrs_op, err);
 	rmr_srv_sess_put_pool(req->srv_pool->pool);
@@ -592,8 +789,22 @@ static void rmr_srv_stop_sync_and_unset_store(struct rmr_pool *pool)
 	}
 }
 
+/* Free the idle entries of @member_id's map before the map is removed. */
+static void rmr_srv_free_idle_entries(struct rmr_pool *pool, u8 member_id)
+{
+	struct rmr_dirty_id_map *map;
+	int idx;
+
+	idx = srcu_read_lock(&pool->map_srcu);
+	map = rmr_pool_find_map(pool, member_id);
+	if (map)
+		rmr_req_free_idle_entries(map);
+	srcu_read_unlock(&pool->map_srcu, idx);
+}
+
 static void rmr_srv_delete_store_member(struct rmr_pool *pool, unsigned long id)
 {
+	rmr_srv_free_idle_entries(pool, id);
 	rmr_pool_remove_map(pool, id);
 	xa_erase(&pool->stg_members, id);
 	rmr_srv_mark_maps_dirty((struct rmr_srv_pool *)pool->priv);
@@ -790,8 +1001,10 @@ static int rmr_srv_set_map(struct rmr_pool *pool, enum rmr_srv_register_disk_mod
 	/*
 	 * The existing map is irrelevant if user asked for store REPLACE.
 	 */
-	if (mode == RMR_SRV_DISK_REPLACE)
+	if (mode == RMR_SRV_DISK_REPLACE) {
+		rmr_srv_free_idle_entries(pool, srv_pool->member_id);
 		rmr_pool_remove_map(pool, srv_pool->member_id);
+	}
 
 	ret = rmr_srv_add_store_member(pool, srv_pool->member_id);
 	if (ret) {
@@ -1454,13 +1667,161 @@ void rmr_srv_put_sync_parent(struct rmr_srv_pool *srv_pool)
 		wake_up_var(parents);
 }
 
+/*
+ * Hand a parked sync waiter back to the sync thread. The thread may take it
+ * and finish before this returns, so the wake-up uses only an address.
+ */
+void rmr_srv_sync_waiter_ready(struct rmr_srv_req *req)
+{
+	struct llist_head *ready = &req->srv_pool->sync_ready;
+
+	llist_add(&req->node, ready);
+	wake_up_var(ready);
+}
+
+/*
+ * Checked before the sync thread starts each chunk. A stop request, or a pool
+ * that can no longer serve, ends the sweep.
+ */
+static int rmr_srv_sync_map_check(struct rmr_srv_pool *srv_pool)
+{
+	if (atomic_read(&srv_pool->thread_state) == SYNC_THREAD_REQ_STOP) {
+		pr_info("Request to stop sync thread\n");
+		return -EINTR;
+	}
+
+	if (!atomic_read(&srv_pool->store_state) ||
+	    atomic_read(&srv_pool->state) != RMR_SRV_POOL_STATE_NORMAL) {
+		atomic_set(&srv_pool->thread_state, SYNC_THREAD_WAIT);
+		pr_err("Pool not in desired state\n");
+		/* Unsure what error to return here */
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+/**
+ * rmr_srv_sync_map_chunk() - start the background sync of one chunk.
+ *
+ * @srv_pool:	the server pool.
+ * @map:	this node's own map.
+ * @chunk:	id.b of the chunk.
+ * @waiter:	in/out: a spare request to park with; used up when parked.
+ *
+ * Description:
+ *	Ends the sweep first if rmr_srv_sync_map_check() says so. A clean
+ *	chunk needs nothing. For a dirty one, @waiter joins the chunk's
+ *	wait_list before the claim is tried, and whoever holds the claim kicks
+ *	that list when it lets go, which hands the waiter back through
+ *	rmr_srv_sync_waiter_ready(). That includes this sweep's own sync, which
+ *	ends partial if sub-blocks are marked stale while it runs, so the sweep
+ *	looks at the chunk again once its holder is done. Joining first means a
+ *	holder that lets go in between is not missed.
+ *
+ * Return:
+ *	0, or a negative errno if the sweep must end or a sync could not be
+ *	started.
+ */
+static int rmr_srv_sync_map_chunk(struct rmr_srv_pool *srv_pool,
+				  struct rmr_dirty_id_map *map, u64 chunk,
+				  struct rmr_srv_req **waiter)
+{
+	rmr_id_t rmr_id = { .a = 1, .b = chunk };
+	struct rmr_map_entry *entry;
+	bool claimed;
+	int err;
+
+	err = rmr_srv_sync_map_check(srv_pool);
+	if (err)
+		return err;
+
+	if (!*waiter) {
+		*waiter = kmem_cache_zalloc(rmr_req_cachep, GFP_KERNEL);
+		if (!*waiter)
+			return -ENOMEM;
+	}
+
+	/*
+	 * Claim under RCU: the lookup and the sync_cnt cmpxchg must run
+	 * in the same RCU read section so the cmpxchg cannot race a
+	 * concurrent call_rcu() free of the entry (e.g. the write fast-path
+	 * freeing a chunk it just fully cleaned). Winning the claim pins the
+	 * entry, so RCU is dropped before the (sleeping) sync.
+	 */
+	rcu_read_lock();
+	entry = rmr_map_get_dirty_entry_rcu(map, rmr_id);
+	if (IS_ERR(entry)) {
+		rcu_read_unlock();
+		pr_err("Cannot create entry for chunk (%llu, %llu)\n",
+		       rmr_id.a, rmr_id.b);
+		return PTR_ERR(entry);
+	}
+
+	if (!entry) {
+		rcu_read_unlock();
+		return 0;
+	}
+
+	(*waiter)->id = rmr_id;
+	(*waiter)->srv_pool = srv_pool;
+	(*waiter)->sync_waiter = true;
+	atomic_inc(&srv_pool->sync_waiters);
+	WRITE_ONCE(entry->parked_for_sync, true);
+	llist_add(&(*waiter)->node, &entry->wait_list);
+	*waiter = NULL;
+	claimed = atomic_cmpxchg(&entry->sync_cnt, -1, 0) == -1;
+	rcu_read_unlock();
+	if (!claimed)
+		return 0;
+
+	err = rmr_srv_sync_chunk_id(srv_pool, entry, rmr_id, true);
+	if (err) {
+		/* Nothing was launched and we still own the claim. */
+		rmr_req_release_claim(entry, 0);
+		pr_err("Failed to sync chunk (%llu, %llu)\n",
+		       rmr_id.a, rmr_id.b);
+	}
+
+	return err;
+}
+
+/*
+ * Take every waiter handed back on sync_ready, free it and look at its chunk
+ * again. A chunk that is still dirty is synced again, which parks a new waiter
+ * on it. After an error the sweep is over, so the waiters are only freed.
+ */
+static int rmr_srv_sync_drain_ready(struct rmr_srv_pool *srv_pool,
+				    struct rmr_dirty_id_map *map,
+				    struct rmr_srv_req **waiter, int err)
+{
+	struct rmr_srv_req *w, *tmp;
+	struct llist_node *ready;
+
+	if (llist_empty(&srv_pool->sync_ready))
+		return err;
+
+	ready = llist_del_all(&srv_pool->sync_ready);
+	llist_for_each_entry_safe(w, tmp, ready, node) {
+		u64 chunk = w->id.b;
+
+		atomic_dec(&srv_pool->sync_waiters);
+		kmem_cache_free(rmr_req_cachep, w);
+		if (!err)
+			err = rmr_srv_sync_map_chunk(srv_pool, map, chunk,
+						     waiter);
+	}
+
+	return err;
+}
+
 static int rmr_srv_sync_map(void *arg)
 {
 	struct rmr_srv_pool *srv_pool = arg;
 	struct rmr_pool *pool = srv_pool->pool;
+	struct llist_head *ready = &srv_pool->sync_ready;
+	struct rmr_srv_req *waiter = NULL;
 	struct rmr_dirty_id_map *map;
-	rmr_id_t rmr_id;
-	struct rmr_map_entry *entry;
 	int err = 0;
 	u64 i;
 
@@ -1477,52 +1838,37 @@ static int rmr_srv_sync_map(void *arg)
 		goto out;
 	}
 
-	rmr_id.a = 1;
-	for (i = 0; i < map->no_of_chunks; i++) {
-		if (atomic_read(&srv_pool->thread_state) == SYNC_THREAD_REQ_STOP) {
-			pr_info("Request to stop sync thread\n");
-			err = -EINTR;
-			goto err;
-		}
-
-		if (!atomic_read(&srv_pool->store_state) ||
-		    atomic_read(&srv_pool->state) != RMR_SRV_POOL_STATE_NORMAL) {
-			atomic_set(&srv_pool->thread_state, SYNC_THREAD_WAIT);
-			pr_err("Pool not in desired state\n");
-			/* Unsure what error to return here */
-			err = -EINVAL;
-			goto err;
-		}
-
-		rmr_id.b = i;
-		entry = rmr_map_get_dirty_entry(map, rmr_id);
-		if (entry) {
-			if (atomic_cmpxchg(&entry->sync_cnt, -1, 0) != -1) {
-				/* someone has already started sync for this id */
-				continue;
-			}
-
-			err = rmr_srv_sync_chunk_id(srv_pool, entry, rmr_id, true);
-			if (err) {
-				/*
-				 * A negative return means nothing was launched
-				 * and we still own the claim, so release it.
-				 */
-				atomic_cmpxchg(&entry->sync_cnt, 0, -1);
-				pr_err("Failed to sync chunk (%llu, %llu)\n", rmr_id.a, rmr_id.b);
-				goto err;
-			}
-		}
+	for (i = 0; i < map->no_of_chunks && !err; i++) {
+		err = rmr_srv_sync_map_chunk(srv_pool, map, i, &waiter);
+		/*
+		 * Take back the waiters of syncs that have ended, so the pass
+		 * holds one only for a chunk with a sync in flight or a client
+		 * request holding it.
+		 */
+		err = rmr_srv_sync_drain_ready(srv_pool, map, &waiter, err);
 	}
+
+	/*
+	 * The rest come back once their holder lets go; sync the ones still
+	 * dirty. After an error only collect them, since each stays linked on
+	 * its chunk until the holder kicks it.
+	 */
+	while (atomic_read(&srv_pool->sync_waiters)) {
+		wait_var_event_interruptible(ready, !llist_empty(ready));
+		err = rmr_srv_sync_drain_ready(srv_pool, map, &waiter, err);
+	}
+
+	if (waiter)
+		kmem_cache_free(rmr_req_cachep, waiter);
 
 	/*
 	 * Finished syncing chunks,
 	 * Now change the thread state to wait,
 	 * to wait for the in flight syncs
 	 */
-	atomic_set(&srv_pool->thread_state, SYNC_THREAD_WAIT);
+	if (!err)
+		atomic_set(&srv_pool->thread_state, SYNC_THREAD_WAIT);
 
-err:
 	while (atomic_read(&srv_pool->in_flight_sync_reqs) != 0) {
 		/*
 		 * Wait for all permits to get freed.
@@ -1814,6 +2160,8 @@ int rmr_srv_remove_clt_pool(struct rmr_srv_pool *srv_pool)
 	pr_info("from pool %s remove sync (internal) pool %s\n",
 		srv_pool->pool->poolname, clt->poolname);
 	srv_pool->clt = NULL;
+	/* A map-clear worker that already read the pointer may still use it. */
+	flush_work(&srv_pool->mapclear_work);
 
 	rmr_clt_close(clt);
 
@@ -2463,9 +2811,11 @@ static int process_msg_map_add(struct rmr_srv_sess *srv_sess,
 			       const void *usr)
 {
 	const struct rmr_msg_io *msg = usr;
+	struct rmr_srv_pool *srv_pool;
 	struct rmr_pool *pool;
 	int i, ret = 0;
 	struct rmr_dirty_id_map *map;
+	rmr_id_t id;
 	u32 group_id = le32_to_cpu(msg->hdr.group_id);
 
 	pr_debug("received map add member_id %u, id (%llu %llu)\n",
@@ -2478,9 +2828,28 @@ static int process_msg_map_add(struct rmr_srv_sess *srv_sess,
 		return PTR_ERR(pool);
 	}
 
+	srv_pool = pool->priv;
+
+	id.a = le64_to_cpu(msg->id_a);
+	id.b = le64_to_cpu(msg->id_b);
+
+	/*
+	 * The client decided from the write replies, and every receiver gets
+	 * the same verdict, an undo or a mark behind. On an undo the write
+	 * fails, so the reply is the undo's error at every receiver, including
+	 * one that keeps the write. A node that took the chunk clean after its
+	 * reply cannot undo the write, so it keeps it and marks the failed
+	 * nodes behind as on a mark behind, and they are resynced from it.
+	 */
+	if (msg->undo_write) {
+		ret = RMR_ERR_NO_COMPLETE_COPY;
+		if (!rmr_srv_undo_write(srv_pool, id, le64_to_cpu(msg->offset),
+					le32_to_cpu(msg->length)))
+			goto put_pool;
+	}
+
 	for (i = 0; i < msg->failed_cnt; i++) {
 		u64 msg_map_ver = le64_to_cpu(msg->map_ver);
-		rmr_id_t id;
 
 		map = rmr_pool_find_map(pool, msg->failed_id[i]);
 		if (!map) {
@@ -2490,16 +2859,14 @@ static int process_msg_map_add(struct rmr_srv_sess *srv_sess,
 		}
 
 		atomic_set(&map->check_state, RMR_MAP_STATE_NO_CHECK);
-		id.a = le64_to_cpu(msg->id_a);
-		id.b = le64_to_cpu(msg->id_b);
 		rmr_map_set_dirty(map, id, 0);
 
 		if (msg_map_ver > pool->map_ver)
 			pool->map_ver = msg_map_ver;
 	}
 	if (msg->failed_cnt) {
-		rmr_srv_mark_pool_md_dirty((struct rmr_srv_pool *)pool->priv);
-		rmr_srv_mark_maps_dirty((struct rmr_srv_pool *)pool->priv);
+		rmr_srv_mark_pool_md_dirty(srv_pool);
+		rmr_srv_mark_maps_dirty(srv_pool);
 	}
 
 put_pool:
@@ -2688,6 +3055,7 @@ static int process_msg_map_ready(struct rmr_pool *pool, bool sync)
 		if (!map)
 			continue;
 
+		rmr_req_free_idle_entries(map);
 		rmr_map_unset_dirty_all(map);
 	}
 	mutex_unlock(&pool->maps_lock);

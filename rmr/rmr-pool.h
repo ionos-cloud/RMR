@@ -109,6 +109,8 @@ struct rmr_pool {
 	u32			subblk_slots_max;
 };
 
+#define RMR_MAPCLEAR_FIFO_SIZE		1024	/* u64 chunk ids; power of 2 */
+
 #define RMR_SUBBLK_CACHE_KB_DEFAULT	16384	/* 16 MiB of slots per map */
 
 /*

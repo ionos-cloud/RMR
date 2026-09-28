@@ -2993,9 +2993,13 @@ static void msg_io_conf(void *priv, int errno)
 	struct rmr_iu *iu		= sess_iu->rmr_iu;
 	rmr_conf_fn *clt_conf		= iu->conf;
 	void *clt_priv = iu->priv;
+	bool partial = errno == RMR_IO_OK_PARTIAL;
 
 	WARN_ON(atomic_read(&pool_sess->state) == RMR_CLT_POOL_SESS_CREATED);
 	WARN_ON(pool_sess->pool->sync);
+
+	if (partial)
+		errno = 0;
 
 	if (errno) {
 		pr_err("%s: For sess %s, id (%llu, %llu), got errno: %d\n",
@@ -3009,6 +3013,8 @@ static void msg_io_conf(void *priv, int errno)
 			 iu->errno, errno, refcount_read(&iu->refcount));
 	} else {
 		atomic_inc(&iu->succeeded);
+		if (!partial)
+			atomic_inc(&iu->full);
 		// TODO: is it ok to clear it here?
 		// rmr_clt_map_remove_id(session->pool, session->pool_id, iu->id);
 	}
@@ -3205,6 +3211,7 @@ int rmr_clt_request(struct rmr_pool *pool, struct rmr_iu *iu,
 		int i;
 
 		atomic_set(&iu->succeeded, 0);
+		atomic_set(&iu->full, 0);
 		idx = srcu_read_lock(&pool->sess_list_srcu);
 		for (i = 0; i < RMR_POOL_MAX_SESS; i++) {
 			struct rmr_clt_pool_sess *ps;

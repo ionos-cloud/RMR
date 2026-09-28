@@ -593,7 +593,15 @@ static void send_map_update_done(struct work_struct *work)
 		if (iu->errno)
 			/* only the last error is reported */
 			iu->errno = errno;
-		pool_sess_change_state(pool_sess, RMR_CLT_POOL_SESS_FAILED);
+
+		/*
+		 * RMR_ERR_NO_COMPLETE_COPY answers an undo and does not mean the
+		 * session is unusable. It fails the IO through iu->errno but
+		 * leaves the leg in service.
+		 */
+		if (errno != RMR_ERR_NO_COMPLETE_COPY)
+			pool_sess_change_state(pool_sess,
+					       RMR_CLT_POOL_SESS_FAILED);
 	}
 
 	pr_debug("%s: Before dec and test iu %p refcnt=%d\n",
@@ -773,6 +781,13 @@ void sched_map_add(struct work_struct *work)
 		}
 	}
 	iu->msg.failed_cnt = failed_cnt;
+
+	/*
+	 * Mark the failed nodes behind, and ack the write, only if some node
+	 * that stored it holds the whole chunk, as its write reply said.
+	 * Otherwise ask the receivers to undo the write.
+	 */
+	iu->msg.undo_write = !atomic_read(&iu->full);
 
 	err = rmr_clt_send_map_update(pool, iu);
 	if (err) {

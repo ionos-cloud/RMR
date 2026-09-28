@@ -21,6 +21,7 @@ static void rmr_req_sync_failed(struct rmr_srv_req *req);
 static void rmr_req_send_map_clear(struct rmr_srv_req *req);
 static void rmr_req_sync_complete(struct rmr_srv_req *req);
 static void rmr_req_store(struct rmr_srv_req *req);
+static void rmr_req_fast_write_done(struct rmr_srv_req *req);
 
 /**
  * rmr_srv_req_resp - Response from the lower level module
@@ -47,7 +48,10 @@ void rmr_srv_req_resp(struct rmr_srv_req *req, int err)
 	 * place. Since its simple.
 	 */
 	if (rmr_op(req->flags) != RMR_OP_SYNCREQ) {
-		rmr_req_complete(req);
+		if (req->fast_write)
+			rmr_req_fast_write_done(req);
+		else
+			rmr_req_complete(req);
 		return;
 	}
 
@@ -182,19 +186,20 @@ static void rmr_req_sched(struct work_struct *work)
 
 void rmr_process_wait_list(struct rmr_map_entry *entry, int err)
 {
-	struct llist_node *first, *next;
-	struct rmr_srv_req *req;
+	struct rmr_srv_req *req, *next;
+	struct llist_node *first;
 
 	pr_debug("processing wait list for entry %p, sync_cnt=%d\n",
 		 entry, atomic_read(&entry->sync_cnt));
 
-	WARN_ON(atomic_read(&entry->sync_cnt) > 0);
-
 	while (!llist_empty(&entry->wait_list)) {
 		first = llist_del_all(&entry->wait_list);
-		while (first) {
-			next = first->next;
-			req = llist_entry(first, struct rmr_srv_req, node);
+		llist_for_each_entry_safe(req, next, first, node) {
+			/* The sync thread decides what its chunk still needs. */
+			if (req->sync_waiter) {
+				rmr_srv_sync_waiter_ready(req);
+				continue;
+			}
 
 			pr_debug("process waiting req %p id (%llu, %llu) flags %u\n",
 				 req, req->id.a, req->id.b, req->flags);
@@ -207,10 +212,65 @@ void rmr_process_wait_list(struct rmr_map_entry *entry, int err)
 			pr_debug("schedule processing req %p with err %d\n", req, req->err);
 			INIT_WORK(&req->work, rmr_req_sched);
 			schedule_work(&req->work);
-
-			first = next;
 		}
 	}
+}
+
+/**
+ * __rmr_req_release_claim() - let go of a chunk's claim and wake what parked
+ * behind it, leaving parked_for_sync as it is.
+ *
+ * @entry:	the chunk's map entry; the caller holds its claim.
+ * @err:	reported to the parked requests, or 0 to let them retry.
+ *
+ * Description:
+ *	Once the claim is released, another CPU can take it, drive the chunk
+ *	clean and free @entry through call_rcu(), so the release and the
+ *	wake-up run under rcu_read_lock(). The release is a fully ordered
+ *	atomic_xchg(), and a request that parks adds itself to the wait_list
+ *	before it tries the claim, so the wake-up below either finds that
+ *	request or that request finds the claim free.
+ */
+static void __rmr_req_release_claim(struct rmr_map_entry *entry, int err)
+{
+	rcu_read_lock();
+	atomic_xchg(&entry->sync_cnt, -1);
+	rmr_process_wait_list(entry, err);
+	rcu_read_unlock();
+}
+
+/**
+ * rmr_req_release_claim() - let go of a chunk a sync claimed and wake what
+ * parked behind it.
+ *
+ * @entry:	the chunk's map entry; the caller holds its sync claim.
+ * @err:	reported to the parked requests, or 0 to let them retry.
+ *
+ * Description:
+ *	Clears parked_for_sync, since the parked requests come back now and
+ *	any that still need a sync set it again, then releases the claim
+ *	through __rmr_req_release_claim().
+ */
+void rmr_req_release_claim(struct rmr_map_entry *entry, int err)
+{
+	WRITE_ONCE(entry->parked_for_sync, false);
+	__rmr_req_release_claim(entry, err);
+}
+
+/**
+ * rmr_req_fully_covers_subblks() - check whether a write fully covers whole
+ * sub-blocks.
+ *
+ * @req:	the incoming request.
+ *
+ * Return:
+ *	true if every byte of @req falls within completely covered sub-blocks.
+ */
+static bool rmr_req_fully_covers_subblks(struct rmr_srv_req *req)
+{
+	return req->length &&
+	       !(req->offset & (RMR_SUBBLK_SIZE - 1)) &&
+	       !(req->length & (RMR_SUBBLK_SIZE - 1));
 }
 
 void rmr_req_submit(struct rmr_srv_req *req)
@@ -218,6 +278,9 @@ void rmr_req_submit(struct rmr_srv_req *req)
 	struct rmr_srv_pool *srv_pool = req->srv_pool;
 	struct rmr_map_entry *entry;
 	struct rmr_dirty_id_map *map;
+	bool needs_sync, claimed;
+	rmr_id_t id;
+	int ret;
 
 	if (rmr_op(req->flags) == RMR_OP_FLUSH && !req->length) {
 		rmr_req_store(req);
@@ -236,7 +299,13 @@ void rmr_req_submit(struct rmr_srv_req *req)
 	}
 
 	rcu_read_lock();
-	entry = rmr_map_get_dirty_entry(map, req->id);
+	entry = rmr_map_get_dirty_entry_rcu(map, req->id);
+	if (IS_ERR(entry)) {
+		rcu_read_unlock();
+		req->err = PTR_ERR(entry);
+		goto err;
+	}
+
 	if (!entry) {
 		/*
 		 * The chunk containing data for this req is NOT dirty for us
@@ -246,51 +315,98 @@ void rmr_req_submit(struct rmr_srv_req *req)
 		rcu_read_unlock();
 		rmr_req_store(req);
 		return;
-	} else {
-		/*
-		 * The chunk for this data is dirty for us.
-		 *
-		 * we have 2 cases.
-		 *
-		 * 1) Its coming from a sync rmr-clt (Its an internal read).
-		 * Then, fail the IO, since we do not want to end up in a deadlock,
-		 * or go through multiple hops for a single read. The sender can try some other
-		 * node itself.
-		 */
-		if (req->sync) {
-			WARN_ON(rmr_op(req->flags) != RMR_OP_READ);
-			rcu_read_unlock();
-			req->err = -EIO;
-			goto err;
-		}
-
-		/*
-		 * 2) If its coming from a non-sync rmr-clt,
-		 *    simply go ahead with syncing the data first.
-		 */
-		llist_add(&req->node, &entry->wait_list);
-		pr_debug("%s: req %p flags %u id (%llu %llu) added to wait list. sync_cnt %d\n",
-			 __func__, req, req->flags, req->id.a, req->id.b,
-			 atomic_read(&entry->sync_cnt));
-
-		rcu_read_unlock();
-		/*
-		 * If we are the first who grabs the entry then start sync.
-		 *
-		 * Otherwise, the one syncing the data would pick us up from the entry->wait_list
-		 * and kick us. So simply exit for now.
-		 */
-		if (atomic_cmpxchg(&entry->sync_cnt, -1, 0) == -1) {
-			int err;
-
-			req->priv = entry;
-			err = rmr_srv_sync_chunk_id(srv_pool, entry, req->id, false);
-			if (err) {
-				atomic_set(&entry->sync_cnt, -1);
-				rmr_process_wait_list(entry, err);
-			}
-		}
 	}
+
+	/*
+	 * The chunk for this data is dirty for us.
+	 *
+	 * we have 2 cases.
+	 *
+	 * 1) Its coming from a sync rmr-clt (Its an internal read).
+	 * Then, fail the IO, since we do not want to end up in a deadlock,
+	 * or go through multiple hops for a single read. The sender can try
+	 * some other node itself.
+	 */
+	if (req->sync) {
+		WARN_ON(rmr_op(req->flags) != RMR_OP_READ);
+		rcu_read_unlock();
+		req->err = -EIO;
+		goto err;
+	}
+
+	/*
+	 * 2a) Write fast-path. If this non-sync write fully covers
+	 *     whole sub-blocks of a single dirty chunk, and no sync
+	 *     is in flight, apply it straight to the backend and mark
+	 *     those sub-blocks in-sync, skipping syncing the data.
+	 *     Partial/unaligned writes, multi-chunk writes, and reads
+	 *     fall through to the park-and-sync path below. A write
+	 *     whose fan-out already lost a peer leg (failed_cnt) also
+	 *     falls through: it must converge the whole chunk so a
+	 *     complete replica exists before the ack, which only the
+	 *     park path does. A covering write also parks while a
+	 *     request that needs a sync is parked, so a stream of such
+	 *     writes cannot keep the claim from it.
+	 */
+	needs_sync = req->id.a != 1 || req->failed_cnt ||
+		     rmr_op(req->flags) != RMR_OP_WRITE ||
+		     !rmr_req_fully_covers_subblks(req);
+	if (!needs_sync && !READ_ONCE(entry->parked_for_sync) &&
+	    atomic_cmpxchg(&entry->sync_cnt, -1, 0) == -1) {
+		/*
+		 * Secure the refinement before the write lands. Without
+		 * a slot recording which sub-blocks this node holds,
+		 * the next whole-chunk resync would pull them from a
+		 * peer that may not hold the same write.
+		 */
+		if (rmr_subblk_get_cached(map, req->id.b)) {
+			rcu_read_unlock();
+			req->priv = entry;
+			req->fast_write = true;
+			pr_debug("%s: fast write req %p id (%llu %llu) off %llu len %u\n",
+				 __func__, req, req->id.a, req->id.b,
+				 req->offset, req->length);
+			rmr_req_store(req);
+			return;
+		}
+
+		/*
+		 * No slot, because the cache is at its cap or the slot
+		 * could not be allocated or inserted. Without one this
+		 * chunk gets no refinement and the fast path is not
+		 * available to it. Hand the claim back and fall through
+		 * to park-and-converge, which is what every write on a
+		 * dirty chunk did before the fast path existed. Kick the
+		 * wait_list because reqs may have parked while we held
+		 * the claim.
+		 */
+		__rmr_req_release_claim(entry, 0);
+		needs_sync = true;
+	}
+
+	/*
+	 * 2b) Park on the chunk's wait_list and trigger a demand sync
+	 *     from the clean peer. A parked req belongs to whoever kicks
+	 *     the wait_list, so it is filled in before it is added.
+	 */
+	if (needs_sync)
+		WRITE_ONCE(entry->parked_for_sync, true);
+	req->priv = entry;
+	id = req->id;
+	pr_debug("%s: req %p flags %u id (%llu %llu) added to wait list. sync_cnt %d\n",
+		 __func__, req, req->flags, id.a, id.b,
+		 atomic_read(&entry->sync_cnt));
+	llist_add(&req->node, &entry->wait_list);
+
+	/* Winning the claim pins the entry, so RCU can end before the sync. */
+	claimed = atomic_cmpxchg(&entry->sync_cnt, -1, 0) == -1;
+	rcu_read_unlock();
+	if (!claimed)
+		return;
+
+	ret = rmr_srv_sync_chunk_id(srv_pool, entry, id, false);
+	if (ret)
+		rmr_req_release_claim(entry, ret);
 
 	return;
 
@@ -310,12 +426,161 @@ static void rmr_req_store(struct rmr_srv_req *req)
 					  req->length, req->flags, req->prio, req);
 	if (err) {
 		pr_err("%s: error submitting req %p, err %d\n", __func__, req, err);
-		req->err = err;
-		if (rmr_op(req->flags) == RMR_OP_SYNCREQ)
-			rmr_req_sync_failed(req);
-		else
-			rmr_req_complete(req);
+		/* A failed submit completes the same way as a failed store. */
+		rmr_srv_req_resp(req, err);
 	}
+}
+
+/**
+ * rmr_map_entry_free_rcu() - RCU callback to wake parked reqs and free a
+ * chunk map entry.
+ *
+ * @head:	the rcu_head embedded in the map entry.
+ *
+ * Description:
+ *	The entry is erased from the map before this is queued, but a reader
+ *	that looked it up earlier may still hold the pointer inside its
+ *	rcu_read_lock section and park on the wait_list there. Draining the
+ *	wait_list here, after every such reader has finished, wakes it.
+ */
+static void rmr_map_entry_free_rcu(struct rcu_head *head)
+{
+	struct rmr_map_entry *entry =
+		container_of(head, struct rmr_map_entry, rcu);
+
+	rmr_process_wait_list(entry, 0);
+	kmem_cache_free(rmr_map_entry_cachep, entry);
+}
+
+/**
+ * rmr_req_free_idle_entries() - free a map's entries that no request holds.
+ *
+ * @map:	a map about to be reset or removed.
+ *
+ * Description:
+ *	A chunk that stays dirty keeps its entry after its holder lets go, and
+ *	resetting or removing the map drops the index without freeing what it
+ *	holds. Each entry nobody holds is claimed, erased and freed after a
+ *	grace period, which also wakes a request that parked on it meanwhile.
+ *	An entry a request holds is left to that request.
+ */
+void rmr_req_free_idle_entries(struct rmr_dirty_id_map *map)
+{
+	struct rmr_map_entry *entry;
+	unsigned long index, flags;
+
+	rcu_read_lock();
+	xa_for_each(&map->rmr_id_map, index, entry) {
+		if (atomic_cmpxchg(&entry->sync_cnt, -1, 0) != -1)
+			continue;
+		xa_lock_irqsave(&map->rmr_id_map, flags);
+		__xa_erase(&map->rmr_id_map, index);
+		xa_unlock_irqrestore(&map->rmr_id_map, flags);
+		call_rcu(&entry->rcu, rmr_map_entry_free_rcu);
+	}
+	rcu_read_unlock();
+}
+
+/**
+ * rmr_req_fast_write_done() - completion handler for a write fast-path store.
+ *
+ * @req:	the fast-path write request; req->priv holds the map entry.
+ *
+ * Description:
+ *	On success, marks the covered sub-blocks in-sync via the bounded
+ *	slot cache. If the chunk's dirty set is now empty, clears the coarse
+ *	dirty bit and frees the entry after an RCU grace period. Otherwise
+ *	releases the per-chunk claim so remaining dirty sub-blocks can be
+ *	synced or overwritten.
+ */
+static void rmr_req_fast_write_done(struct rmr_srv_req *req)
+{
+	struct rmr_srv_pool *srv_pool = req->srv_pool;
+	struct rmr_map_entry *entry = req->priv;
+	struct rmr_dirty_id_map *map;
+	struct rmr_subblk_slot *slot;
+	enum rmr_subblk_state state;
+	u32 first, count;
+	bool clean = false;
+	int lock_idx;
+
+	if (req->err)
+		goto out;
+
+	/*
+	 * rmr_pool_find_map() hands back the pointer with no protection, and
+	 * rmr_pool_remove_map() frees the map page once
+	 * synchronize_srcu(&pool->map_srcu) has passed. It does not wait on
+	 * pool->ids_inflight_ref, so being an in-flight I/O does not pin the
+	 * map. Hold map_srcu for as long as we touch it.
+	 */
+	lock_idx = srcu_read_lock(&srv_pool->pool->map_srcu);
+	map = rmr_pool_find_map(srv_pool->pool, srv_pool->member_id);
+	if (WARN(!map, "%s: no map for pool_id %u\n", __func__,
+		 srv_pool->member_id)) {
+		req->err = -ENOENT;
+		goto unlock;
+	}
+
+	count = rmr_subblk_covered(srv_pool->pool->chunk_size_shift,
+				   req->offset, req->length, &first);
+	if (!count)
+		goto unlock;
+
+	/*
+	 * Submit secured this slot before the write was applied, so a
+	 * missing slot means this node's own map was marked dirty again
+	 * or reset meanwhile. The slot is not recreated, so this write
+	 * does not take the chunk clean.
+	 */
+	rcu_read_lock();
+	slot = rmr_subblk_lookup(map, req->id.b);
+	if (slot)
+		rmr_subblk_slot_clear(slot, first, count);
+	rcu_read_unlock();
+	if (!slot)
+		goto unlock;
+
+	/*
+	 * Judge the chunk against the slot the cache holds now,
+	 * not the one cleared above. A re-dirty between the two
+	 * detaches that slot and sets the coarse bit, and judging
+	 * the detached bitmap would clear that bit again.
+	 */
+	state = rmr_subblk_take_if_clean(map, req->id.b);
+	if (state != RMR_SUBBLK_CLEAN_TAKEN)
+		goto unlock;
+
+	/* The dirty bit went with the slot; only the entry is left. */
+	rmr_map_erase_entry(map, req->id);
+	/*
+	 * The peers still have this node down as behind for the chunk.
+	 * Queue the MAP_CLEAR rather than send it here: this runs from
+	 * the IO completion, where getting an iu may sleep.
+	 */
+	rmr_srv_mapclear_queue(srv_pool, req->id.b);
+	clean = true;
+
+unlock:
+	srcu_read_unlock(&srv_pool->pool->map_srcu, lock_idx);
+out:
+	if (clean) {
+		/*
+		 * Keep sync_cnt claimed so a late submitter parks instead of
+		 * taking a retired entry; the RCU callback wakes it.
+		 */
+		call_rcu(&entry->rcu, rmr_map_entry_free_rcu);
+	} else {
+		/*
+		 * A fast write is not a sync, so it leaves parked_for_sync
+		 * set, and a request waiting for a sync stays ahead of later
+		 * covering writes.
+		 */
+		__rmr_req_release_claim(entry, req->err);
+	}
+
+	req->fast_partial = !req->err && !clean;
+	rmr_req_complete(req);
 }
 
 static void rmr_md_req_store(struct rmr_srv_req *req)
@@ -686,8 +951,7 @@ static void __release_parent_req(struct rcu_head *head)
 		 * thread can claim the chunk again, and leave the entry for it
 		 * to find, unless a reset already dropped it from the index.
 		 */
-		atomic_set(&entry->sync_cnt, -1);
-		rmr_process_wait_list(entry, req->err);
+		rmr_req_release_claim(entry, req->err);
 	} else {
 		pr_debug("req %p, completed all sync req, lets clean map\n", req);
 		rmr_process_wait_list(entry, 0);
@@ -984,15 +1248,7 @@ static void rmr_req_send_map_clear(struct rmr_srv_req *req)
 	 *
 	 * We also update the minimum members needed for map update.
 	 */
-	iu->msg.hdr.group_id = cpu_to_le32(pool->group_id);
-	iu->msg.hdr.type = cpu_to_le16(RMR_MSG_MAP_CLEAR);
-	iu->msg.hdr.__padding = 0;
-
-	iu->msg.id_a = cpu_to_le64(req->id.a);
-	iu->msg.id_b = cpu_to_le64(req->id.b);
-	iu->msg.member_id = srv_pool->member_id;
-
-	iu->msg.flags = cpu_to_le32(RMR_OP_WRITE);
+	rmr_srv_fill_map_clear(iu, pool, srv_pool->member_id, req->id);
 
 	iu->conf = rmr_req_map_clear_done;
 	iu->priv = req;

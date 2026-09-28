@@ -249,7 +249,15 @@ static inline u32 rmr_subblk_kb_to_slots(u32 kb)
 
 struct rmr_map_entry {
 	atomic_t sync_cnt;
+	/*
+	 * Set while a request that needs a sync is parked on @wait_list, and
+	 * cleared when a sync lets go of the chunk. While it is set, a covering
+	 * write parks too instead of taking the claim for the write fast path.
+	 */
+	bool parked_for_sync;
 	struct llist_head wait_list;
+
+	struct rcu_head rcu;
 };
 
 /*
@@ -273,6 +281,8 @@ enum rmr_subblk_state {
 
 enum rmr_subblk_state rmr_subblk_take_if_clean(struct rmr_dirty_id_map *map,
 					       u64 chunk);
+bool rmr_subblk_undo(struct rmr_dirty_id_map *map, u64 chunk, u32 first,
+		     u32 count);
 void rmr_map_erase_entry(struct rmr_dirty_id_map *map, rmr_id_t id);
 
 bool rmr_subblk_snapshot_bits(struct rmr_dirty_id_map *map, u64 chunk,
@@ -319,7 +329,9 @@ void rmr_map_set_dirty(struct rmr_dirty_id_map *map, rmr_id_t id, u8 filter);
 void rmr_map_set_dirty_all(struct rmr_dirty_id_map *map, u8 filter);
 struct rmr_map_entry *rmr_map_unset_dirty(struct rmr_dirty_id_map *map, rmr_id_t id, u8 filter);
 bool rmr_map_check_dirty(struct rmr_dirty_id_map *map, rmr_id_t id);
-struct rmr_map_entry *rmr_map_get_dirty_entry(struct rmr_dirty_id_map *map, rmr_id_t id);
+struct rmr_map_entry *rmr_map_find_dirty_entry(struct rmr_dirty_id_map *map, rmr_id_t id);
+int rmr_map_create_dirty_entry(struct rmr_dirty_id_map *map, rmr_id_t id);
+struct rmr_map_entry *rmr_map_get_dirty_entry_rcu(struct rmr_dirty_id_map *map, rmr_id_t id);
 void rmr_map_clear_filter_all(struct rmr_dirty_id_map *map, u8 filter);
 void rmr_map_unset_dirty_all(struct rmr_dirty_id_map *map);
 bool rmr_map_empty(struct rmr_dirty_id_map *map);

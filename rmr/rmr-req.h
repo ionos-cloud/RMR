@@ -37,6 +37,12 @@ struct rmr_srv_req {
 	struct rmr_iu *iu;
 	struct rmr_srv_req *parent;
 	bool sync;
+	bool fast_write;
+	/*
+	 * Fast-path write did not take its chunk clean, so the reply is
+	 * RMR_IO_OK_PARTIAL.
+	 */
+	bool fast_partial;
 	/*
 	 * Set on a parent sync req that found a slot when the transfer started.
 	 * A slot missing at completion then means this node's own map was
@@ -50,6 +56,13 @@ struct rmr_srv_req {
 	 * the index for the next sync unless a map reset dropped it.
 	 */
 	bool keep_entry;
+	/*
+	 * A token the background sync thread parks on each chunk it syncs or
+	 * finds claimed. It carries no I/O. When the holder kicks the
+	 * wait_list, it goes back to the sync thread instead of being
+	 * resubmitted.
+	 */
+	bool sync_waiter;
 	struct rcu_head rcu;
 };
 
@@ -70,6 +83,8 @@ int rmr_srv_sync_chunk_id(struct rmr_srv_pool *srv_pool, struct rmr_map_entry *e
 			  rmr_id_t id, bool from_sync);
 
 void rmr_process_wait_list(struct rmr_map_entry *entry, int err);
+void rmr_req_release_claim(struct rmr_map_entry *entry, int err);
+void rmr_req_free_idle_entries(struct rmr_dirty_id_map *map);
 
 struct rmr_map_entry_info {
 	rmr_id_t id;
