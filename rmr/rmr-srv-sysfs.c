@@ -36,9 +36,11 @@ int rmr_srv_sysfs_add_sess(struct rmr_pool *pool,
 	ret = kobject_init_and_add(&pool_sess->kobj, &rmr_srv_sess_ktype,
 				   &pool->sessions_kobj, "%s",
 				   pool_sess->sessname);
-	if (ret)
+	if (ret) {
 		pr_err("Failed to add session %s into sysfs\n",
 		       pool_sess->sessname);
+		kobject_put(&pool_sess->kobj);
+	}
 
 	return ret;
 }
@@ -897,7 +899,7 @@ static int rmr_srv_create_pool_sysfs_files(struct rmr_pool *pool)
 	if (ret) {
 		pr_err("Failed to create sysfs dir for pool '%s': %d\n",
 		       pool->poolname, ret);
-		return ret;
+		goto put_pool_kobj;
 	}
 
 	ret = kobject_init_and_add(&pool->sessions_kobj, &ktype, &pool->kobj,
@@ -905,9 +907,16 @@ static int rmr_srv_create_pool_sysfs_files(struct rmr_pool *pool)
 	if (unlikely(ret)) {
 		pr_err("Failed to create sessions dir for pool '%s': %d\n",
 		       pool->poolname, ret);
-		kobject_del(&pool->kobj);
-		kobject_put(&pool->kobj);
+		goto put_sessions_kobj;
 	}
+
+	return 0;
+
+put_sessions_kobj:
+	kobject_put(&pool->sessions_kobj);
+	kobject_del(&pool->kobj);
+put_pool_kobj:
+	kobject_put(&pool->kobj);
 
 	return ret;
 }
