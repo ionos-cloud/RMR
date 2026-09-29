@@ -328,17 +328,25 @@ static int brmr_clt_create_dev_sysfs_files(struct brmr_clt_dev *dev)
 	ret = kobject_init_and_add(&dev->kobj, &brmr_clt_device_ktype,
 				   brmr_devs_kobj,
 				   "%s", dev->gd->disk_name);
-	if (ret)
+	if (ret) {
 		pr_err("Failed to create sysfs dir for device '%s': %d\n",
 		       dev->gd->disk_name, ret);
+		goto put_dev_kobj;
+	}
 
 	ret = brmr_clt_create_stats_files(&dev->kobj, &dev->kobj_stats);
 	if (unlikely(ret)) {
 		pr_err("Failed to create sysfs stats files "
 		       "for device '%s': %d\n", dev->gd->disk_name, ret);
-		kobject_del(&dev->kobj);
-		kobject_put(&dev->kobj);
+		goto del_dev_kobj;
 	}
+	return 0;
+
+del_dev_kobj:
+	kobject_del(&dev->kobj);
+put_dev_kobj:
+	kobject_put(&dev->kobj);
+
 	return ret;
 }
 
@@ -445,20 +453,21 @@ static int brmr_clt_create_stats_files(struct kobject *kobj,
 	if (ret) {
 		pr_err("Failed to init and add stats kobject, err: %d\n",
 		       ret);
-		return ret;
+		goto put_stats_obj;
 	}
 
 	ret = sysfs_create_group(kobj_stats, &brmr_stats_attr_group);
 	if (ret) {
 		pr_err("failed to create stats sysfs group, err: %d\n",
 		       ret);
-		goto put_stats_obj;
+		goto del_stats_obj;
 	}
 
 	return 0;
 
-put_stats_obj:
+del_stats_obj:
 	kobject_del(kobj_stats);
+put_stats_obj:
 	kobject_put(kobj_stats);
 
 	return ret;
