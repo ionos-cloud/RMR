@@ -1192,9 +1192,8 @@ static int rmr_clt_parse_join_opts(const char *buf, char *poolname,
 	if (!options)
 		return -ENOMEM;
 
-	options = strstrip(options);
-	strip(options);
-	sep_opt = options;
+	sep_opt = strstrip(options);
+	strip(sep_opt);
 	while ((p = strsep(&sep_opt, " ")) != NULL) {
 		if (!*p)
 			continue;

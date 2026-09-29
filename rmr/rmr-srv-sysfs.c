@@ -847,7 +847,7 @@ static const match_table_t rmr_srv_opt_tokens = {
 static int rmr_srv_parse_options(const char *buf, char *poolname,
 				 u32 *member_id)
 {
-	char *options, *p;
+	char *options, *sep_opt, *p;
 	substring_t args[MAX_OPT_ARGS];
 	int opt_mask = 0;
 	int token, ret = 0, i;
@@ -856,9 +856,9 @@ static int rmr_srv_parse_options(const char *buf, char *poolname,
 	if (!options)
 		return -ENOMEM;
 
-	options = strstrip(options);
-	strip(options);
-	while ((p = strsep(&options, " ")) != NULL) {
+	sep_opt = strstrip(options);
+	strip(sep_opt);
+	while ((p = strsep(&sep_opt, " ")) != NULL) {
 		if (!*p)
 			continue;
 		token = match_token(p, rmr_srv_opt_tokens, args);
