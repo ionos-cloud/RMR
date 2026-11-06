@@ -2635,6 +2635,62 @@ static struct rmr_clt_pool_sess *rmr_clt_round_robin_sess(struct rmr_pool *pool,
 	return rmr_clt_get_first_normal_session(pool);
 }
 
+/*
+ * rmr_clt_sess_clean_for - is @pool_sess NORMAL and does the client believe
+ * its member is in sync for chunk @id?
+ *
+ * The check is best-effort and lags reality where a leg has already synced
+ * a chunk but the client has not cleared its map yet, because the client
+ * clears a leg's whole-map only after the leg reports it empty to the
+ * periodic MAP_CHECK poll.
+ *
+ * This assumes a single-chunk request. A future multi-chunk request must
+ * test the whole id range before a leg can be called clean for it.
+ */
+static bool rmr_clt_sess_clean_for(struct rmr_pool *pool,
+				   struct rmr_clt_pool_sess *pool_sess,
+				   rmr_id_t id)
+{
+	struct rmr_dirty_id_map *map;
+	int map_idx;
+	bool clean;
+
+	if (atomic_read(&pool_sess->state) != RMR_CLT_POOL_SESS_NORMAL ||
+	     pool_sess->clt_sess->state == RMR_CLT_SESS_DISCONNECTED ||
+	     pool->sync)
+		return false;
+
+	map_idx = srcu_read_lock(&pool->map_srcu);
+	map = rmr_pool_find_map(pool, pool_sess->member_id);
+	clean = !rmr_map_check_dirty(map, id);
+	srcu_read_unlock(&pool->map_srcu, map_idx);
+
+	return clean;
+}
+
+/*
+ * rmr_clt_pick_clean_sess - pick a NORMAL pool_sess the client believes is in
+ * sync for chunk @id, skipping any pool_sess already attached to @iu (or all
+ * if @iu is NULL).
+ *
+ * Caller must hold pool->sess_list_srcu. Returns NULL if no candidate.
+ */
+static struct rmr_clt_pool_sess *
+rmr_clt_pick_clean_sess(struct rmr_pool *pool, rmr_id_t id, struct rmr_iu *iu)
+{
+	struct rmr_clt_pool_sess *pool_sess;
+
+	list_for_each_entry_srcu(pool_sess, &pool->sess_list, entry,
+				 srcu_read_lock_held(&pool->sess_list_srcu)) {
+		if (rmr_clt_pool_sess_in_iu(iu, pool_sess))
+			continue;
+
+		if (rmr_clt_sess_clean_for(pool, pool_sess, id))
+			return pool_sess;
+	}
+	return NULL;
+}
+
 int rmr_clt_query(struct rmr_pool *pool, struct rmr_attrs *attr)
 {
 	struct rmr_clt_pool_sess *pool_sess;
@@ -2902,11 +2958,20 @@ static void retry_failed_read(struct work_struct *work)
 	struct rmr_clt_sess_iu *sess_iu;
 	struct rtrs_clt_req_ops req_ops;
 	struct kvec vec;
+	rmr_id_t id;
 	int err, idx;
 
 	idx = srcu_read_lock(&pool->sess_list_srcu);
 
-	pool_sess = rmr_clt_round_robin_sess(pool, iu);
+	/*
+	 * Prefer an untried leg the client believes is clean for the chunk;
+	 * if none is known clean, fall back to the first untried leg in
+	 * list order, whatever its state.
+	 */
+	id.a = le64_to_cpu(iu->msg.id_a);
+	id.b = le64_to_cpu(iu->msg.id_b);
+	pool_sess = rmr_clt_pick_clean_sess(pool, id, iu) ?:
+			rmr_clt_round_robin_sess(pool, iu);
 	if (!pool_sess)
 		goto give_up;
 
@@ -3202,6 +3267,49 @@ int rmr_clt_request(struct rmr_pool *pool, struct rmr_iu *iu,
 	if (rmr_flag == RMR_OP_READ) {
 		iu->sg = sg;
 		iu->sg_cnt = sg_cnt;
+
+		/*
+		 * Dirty-aware read routing. rmr_clt_get_iu picked a pool_sess
+		 * via round-robin without consulting the dirty map. If the
+		 * client's view says that pick is dirty for the chunk, try to
+		 * swap to a NORMAL leg the client believes is clean. Falls
+		 * back to the original pick if no clean leg is known or the
+		 * permit acquisition fails.
+		 *
+		 * TODO: Client map update should happen more often, and not
+		 * just once when the whole node is synced.
+		 */
+		if (!pool->sync && sg_len) {
+			struct rmr_clt_sess_iu *cur_sess_iu;
+			struct rmr_clt_pool_sess *cur, *clean;
+			int sess_idx;
+
+			cur_sess_iu = list_first_entry(&iu->sess_list,
+						       struct rmr_clt_sess_iu,
+						       entry);
+			cur = cur_sess_iu->pool_sess;
+
+			sess_idx = srcu_read_lock(&pool->sess_list_srcu);
+			if (!rmr_clt_sess_clean_for(pool, cur, id)) {
+				/* TODO: We need a round-robin version of this */
+				clean = rmr_clt_pick_clean_sess(pool, id, iu);
+				if (clean) {
+					struct rmr_clt_sess_iu *new_sess_iu;
+
+					new_sess_iu = rmr_get_sess_iu(clean,
+								      RTRS_IO_CON,
+								      (enum wait_type)NO_WAIT);
+					if (new_sess_iu) {
+						list_del(&cur_sess_iu->entry);
+						rmr_put_sess_iu(cur, cur_sess_iu);
+						new_sess_iu->rmr_iu = iu;
+						list_add_tail(&new_sess_iu->entry,
+							      &iu->sess_list);
+					}
+				}
+			}
+			srcu_read_unlock(&pool->sess_list_srcu, sess_idx);
+		}
 	} else if (!pool->sync && rmr_flag == RMR_OP_WRITE) {
 		/*
 		 * We take this path only for request from client side
