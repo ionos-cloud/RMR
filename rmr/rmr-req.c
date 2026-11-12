@@ -566,9 +566,12 @@ unlock:
 out:
 	if (clean) {
 		/*
-		 * Keep sync_cnt claimed so a late submitter parks instead of
-		 * taking a retired entry; the RCU callback wakes it.
+		 * The entry is out of the map, so wake what parked on it now.
+		 * sync_cnt stays claimed, so a submitter that looked the entry
+		 * up before the erase parks instead of taking it, and the RCU
+		 * callback wakes that one.
 		 */
+		rmr_process_wait_list(entry, 0);
 		call_rcu(&entry->rcu, rmr_map_entry_free_rcu);
 	} else {
 		/*
@@ -954,6 +957,7 @@ static void __release_parent_req(struct rcu_head *head)
 		rmr_req_release_claim(entry, req->err);
 	} else {
 		pr_debug("req %p, completed all sync req, lets clean map\n", req);
+		/* Wakes a submitter that parked after rmr_req_sync_release(). */
 		rmr_process_wait_list(entry, 0);
 		pr_debug("free entry %p for req %p\n", entry, req);
 		kmem_cache_free(rmr_map_entry_cachep, entry);
@@ -971,10 +975,18 @@ static void __release_parent_req(struct rcu_head *head)
  *
  * @req:	the parent sync request.
  * @free_entry:	true once the chunk is clean and the entry can be reclaimed.
+ *
+ * Description:
+ *	A clean chunk's entry is already out of the map, so the requests
+ *	parked on it are woken here. The claim stays held, so a submitter that
+ *	looked the entry up before it was erased parks instead of taking it,
+ *	and __release_parent_req() wakes that one after the grace period.
  */
 static void rmr_req_sync_release(struct rmr_srv_req *req, bool free_entry)
 {
 	req->keep_entry = !free_entry;
+	if (free_entry)
+		rmr_process_wait_list(req->priv, 0);
 	call_rcu(&req->rcu, __release_parent_req);
 }
 
