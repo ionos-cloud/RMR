@@ -176,7 +176,20 @@ struct rmr_dirty_id_map *rmr_map_create(struct rmr_pool *pool, u8 member_id)
 		goto err_map;
 	}
 
-	xa_init_flags(&map->rmr_id_map, XA_FLAGS_ALLOC);
+	/*
+	 * Every acquisition of this lock excludes interrupts, so the index can
+	 * be updated from IO completion, which may run in interrupt context.
+	 * Lockdep puts this lock in one class with the sub-block cache's
+	 * xa_lock, both being set up through xa_init_flags() here, so a cache
+	 * update from IO completion needs this as well. Inserts allocate with
+	 * GFP_KERNEL and run in process context through xa_insert_irq(); with
+	 * XA_FLAGS_LOCK_IRQ the allocation retry drops the lock with interrupts
+	 * enabled and retakes it with them disabled.
+	 */
+	xa_init_flags(&map->rmr_id_map, XA_FLAGS_ALLOC | XA_FLAGS_LOCK_IRQ);
+	xa_init(&map->subblk_cache);
+	spin_lock_init(&map->subblk_cache_lock);
+	map->pool = pool;
 	map->member_id = member_id;
 	map->ts = jiffies;
 
@@ -199,10 +212,19 @@ void rmr_map_destroy(struct rmr_dirty_id_map *map)
 	int i, j;
 	u64 no_of_slps;
 
+	/*
+	 * Callers drain the cache before this, through
+	 * rmr_map_unset_dirty_all(), or never fill it (client maps). Drain
+	 * again so that no slot outlives the map, should one have been
+	 * installed after that drain.
+	 */
+	rmr_subblk_drain_all(map);
+
 	WARN_ON(!xa_empty(&map->rmr_id_map));
 	map->ts = jiffies;
 
 	pr_info("%s: member_id %u\n", __func__, map->member_id);
+	xa_destroy(&map->subblk_cache);
 	kfree(map->bitmap_filter);
 
 	for (i = 0; i < map->no_of_flp; i++) {
@@ -220,6 +242,235 @@ void rmr_map_destroy(struct rmr_dirty_id_map *map)
 	}
 
 	free_page((unsigned long)map);
+}
+
+/*
+ * Bounded sub-block slot cache helpers.
+ *
+ * The cache holds struct rmr_subblk_slot keyed by chunk id in
+ * map->subblk_cache. A slot exists for a chunk if and only if the chunk is in
+ * the PARTIAL state.
+ *
+ * The cap is enforced by refusing to admit a new slot. A caller that cannot get
+ * one converges the chunk instead.
+ *
+ * Lock discipline:
+ *   map->subblk_cache_lock serializes all mutations. xarray operations
+ *   use GFP_NOWAIT under the spinlock to avoid sleeping; allocation
+ *   failure causes the chunk to fall back to FULLY_DIRTY. Slot teardown
+ *   is RCU-deferred via kfree_rcu so readers under rcu_read_lock()
+ *   remain safe.
+ */
+
+/* Slots erased per critical section by rmr_subblk_drain_all(). */
+#define RMR_SUBBLK_DRAIN_BATCH 512
+
+/**
+ * rmr_subblk_lookup() - look up a chunk's slot.
+ *
+ * @map:	the dirty-id map owning the cache.
+ * @chunk:	id.b of the chunk to look up.
+ *
+ * Description:
+ *	A miss means the chunk has no refinement and is treated as
+ *	FULLY_DIRTY.
+ *
+ * Context:
+ *	Call with rcu_read_lock() held. Slots are freed with kfree_rcu(), so
+ *	that read section keeps the returned slot valid even if it is removed
+ *	from the cache meanwhile.
+ *
+ * Return:
+ *	the slot for @chunk, or NULL on a miss.
+ */
+struct rmr_subblk_slot *rmr_subblk_lookup(struct rmr_dirty_id_map *map,
+					  u64 chunk)
+{
+	return xa_load(&map->subblk_cache, chunk);
+}
+
+/**
+ * rmr_subblk_get_cached() - return a chunk's slot, installing one if missing.
+ *
+ * @map:	the dirty-id map owning the cache.
+ * @chunk:	id.b of the chunk.
+ *
+ * Description:
+ *	An existing slot is returned even when the cache is at its cap; the
+ *	cap only limits how many new slots are admitted.
+ *	Refuses rather than discards when the cap is reached, so a caller that
+ *	gets NULL must converge the chunk instead of relying on a refinement.
+ *	A caller that loses the race to install a chunk's first slot frees
+ *	its own and returns the winner's, also at the cap.
+ *
+ * Context:
+ *	Call with rcu_read_lock() held; does not sleep.
+ *
+ * Return:
+ *	the existing or new slot on success; NULL when the cap is reached or
+ *	on allocation/insertion failure (caller treats the chunk as
+ *	FULLY_DIRTY).
+ */
+struct rmr_subblk_slot *rmr_subblk_get_cached(struct rmr_dirty_id_map *map,
+					      u64 chunk)
+{
+	u32 nr_subblk = 1U << (map->pool->chunk_size_shift - RMR_SUBBLK_SHIFT);
+	struct rmr_subblk_slot *slot, *new_slot;
+	unsigned long flags;
+
+	slot = rmr_subblk_lookup(map, chunk);
+	if (slot)
+		return slot;
+
+	new_slot = rmr_subblk_slot_alloc(nr_subblk);
+	if (!new_slot)
+		return NULL;
+
+	spin_lock_irqsave(&map->subblk_cache_lock, flags);
+	/*
+	 * Every insert holds this lock, so a slot another caller installed
+	 * since the lookup above is found here, before the cap can refuse.
+	 */
+	slot = xa_load(&map->subblk_cache, chunk);
+	if (slot)
+		goto unlock;
+
+	/*
+	 * Checked under the lock that guards the count, so the cap admits
+	 * exactly as many slots as it says. It bounds the slots themselves;
+	 * the xarray nodes indexing them are not counted.
+	 */
+	if (map->subblk_nr >= READ_ONCE(map->pool->subblk_slots_max) ||
+	    xa_insert(&map->subblk_cache, chunk, new_slot, GFP_NOWAIT))
+		goto unlock;
+
+	map->subblk_nr++;
+	slot = new_slot;
+unlock:
+	spin_unlock_irqrestore(&map->subblk_cache_lock, flags);
+
+	/* Free the new slot unless the cache took it. */
+	if (slot != new_slot)
+		kfree(new_slot);
+
+	return slot;
+}
+
+/* rmr_subblk_remove() with subblk_cache_lock already held. */
+static void __rmr_subblk_remove(struct rmr_dirty_id_map *map, u64 chunk)
+{
+	struct rmr_subblk_slot *s;
+
+	s = xa_erase(&map->subblk_cache, chunk);
+	if (!s)
+		return;
+	map->subblk_nr--;
+	kfree_rcu(s, rcu);
+}
+
+/**
+ * rmr_subblk_remove() - drop the cache slot for @chunk.
+ *
+ * @map:	the dirty-id map owning the cache.
+ * @chunk:	id.b of the chunk whose slot is to be removed.
+ *
+ * Description:
+ *	Used when rmr_map_unset_dirty() clears a chunk, since a slot only
+ *	describes a dirty chunk. A re-dirty and a clean verdict do not use it:
+ *	each drops the slot in the same subblk_cache_lock section as its
+ *	dirty-bit update.
+ */
+static void rmr_subblk_remove(struct rmr_dirty_id_map *map, u64 chunk)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&map->subblk_cache_lock, flags);
+	__rmr_subblk_remove(map, chunk);
+	spin_unlock_irqrestore(&map->subblk_cache_lock, flags);
+}
+
+/**
+ * rmr_subblk_snapshot_bits() - copy a slot's dirty bitmap into @dst_bits.
+ *
+ * @map:	the dirty-id map owning the slot cache.
+ * @chunk:	id.b of the chunk to look up.
+ * @dst_bits:	caller-provided buffer; filled under the slot's spinlock.
+ * @nr_subblk:	set to the slot's sub-block count on success.
+ *
+ * Description:
+ *	After return the caller may walk @dst_bits without RCU held. The
+ *	chunk's sync claim keeps writes from marking sub-blocks in sync behind
+ *	the copy, so the walk never under-syncs what was stale. A sub-block
+ *	marked stale after the copy is not in it, so finishing the walk alone
+ *	does not prove the chunk converged.
+ *
+ * Context:
+ *	Call with rcu_read_lock() and the chunk's sync claim held.
+ *
+ * Return:
+ *	true if a slot existed for @chunk, false otherwise.
+ */
+bool rmr_subblk_snapshot_bits(struct rmr_dirty_id_map *map, u64 chunk,
+			      unsigned long *dst_bits, u32 *nr_subblk)
+{
+	struct rmr_subblk_slot *s;
+	unsigned long flags;
+
+	s = xa_load(&map->subblk_cache, chunk);
+	if (!s)
+		return false;
+
+	spin_lock_irqsave(&s->lock, flags);
+	*nr_subblk = s->nr_subblk;
+	bitmap_copy(dst_bits, s->bits, s->nr_subblk);
+	spin_unlock_irqrestore(&s->lock, flags);
+
+	return true;
+}
+
+/**
+ * rmr_subblk_drain_all() - drop every slot from the sub-block cache.
+ *
+ * @map:	the dirty-id map owning the cache.
+ *
+ * Description:
+ *	Called from teardown and mass-clear paths where all refinement
+ *	records are stale. Slots are RCU-freed so concurrent readers
+ *	remain safe.
+ */
+void rmr_subblk_drain_all(struct rmr_dirty_id_map *map)
+{
+	struct rmr_subblk_slot *s;
+	unsigned long index;
+	unsigned long flags;
+	unsigned int n;
+
+	if (xa_empty(&map->subblk_cache))
+		return;
+
+	/*
+	 * Bounded batches: the lock is held with interrupts off, and the cap
+	 * admits enough slots that erasing all of them in one critical section
+	 * would disable interrupts for the length of the walk. Keep going until
+	 * a batch comes up short, since dropping the lock between batches lets
+	 * a concurrent write admit a slot.
+	 */
+	do {
+		n = 0;
+		spin_lock_irqsave(&map->subblk_cache_lock, flags);
+		xa_for_each(&map->subblk_cache, index, s) {
+			/*
+			 * xa_erase takes xa_lock internally; safe under our own
+			 * cache lock and inside xa_for_each (the iterator
+			 * tolerates removal of the current entry). kfree_rcu()
+			 * does not sleep, so the slot is freed here.
+			 */
+			__rmr_subblk_remove(map, index);
+			if (++n == RMR_SUBBLK_DRAIN_BATCH)
+				break;
+		}
+		spin_unlock_irqrestore(&map->subblk_cache_lock, flags);
+	} while (n == RMR_SUBBLK_DRAIN_BATCH);
 }
 
 /**
@@ -319,6 +570,90 @@ static void rmr_chunk_md_unset_dirty(u8 *chunk_md)
 }
 
 /**
+ * rmr_subblk_take_if_clean() - classify a chunk's refinement and claim the
+ * transition out of PARTIAL.
+ *
+ * @map:	the dirty-id map owning the cache.
+ * @chunk:	id.b of the chunk to classify.
+ *
+ * Description:
+ *	When every sub-block of the cache's current slot is in sync, erases
+ *	the slot and clears the chunk's dirty bit in one subblk_cache_lock
+ *	section. rmr_map_set_dirty() drops the slot and sets the bit under the
+ *	same lock, so a re-dirty shows up here as a missing slot or lands after
+ *	the clear. A caller that got CLEAN_TAKEN must not clear the bit again.
+ *
+ * Return:
+ *	RMR_SUBBLK_CLEAN_TAKEN when this call erased an all-clean slot and
+ *	cleared the chunk's dirty bit;
+ *	RMR_SUBBLK_PARTIAL when sub-blocks are still dirty;
+ *	RMR_SUBBLK_ABSENT when no slot is cached for @chunk.
+ */
+enum rmr_subblk_state rmr_subblk_take_if_clean(struct rmr_dirty_id_map *map,
+					       u64 chunk)
+{
+	rmr_id_t id = { .a = 1, .b = chunk };
+	struct rmr_subblk_slot *s;
+	enum rmr_subblk_state st;
+	unsigned long flags;
+
+	spin_lock_irqsave(&map->subblk_cache_lock, flags);
+	s = xa_load(&map->subblk_cache, chunk);
+	if (!s) {
+		st = RMR_SUBBLK_ABSENT;
+	} else if (rmr_subblk_slot_all_clean(s)) {
+		__rmr_subblk_remove(map, chunk);
+		rmr_chunk_md_unset_dirty(rmr_get_chunk_md_from_id(map, id));
+		st = RMR_SUBBLK_CLEAN_TAKEN;
+	} else {
+		st = RMR_SUBBLK_PARTIAL;
+	}
+
+	spin_unlock_irqrestore(&map->subblk_cache_lock, flags);
+
+	return st;
+}
+
+/**
+ * rmr_subblk_undo() - mark an undone write's sub-blocks as needing sync again.
+ *
+ * @map:	this node's own map.
+ * @chunk:	id.b of the chunk.
+ * @first:	index of the first sub-block the write touched.
+ * @count:	number of sub-blocks it touched.
+ *
+ * Description:
+ *	With a slot, the write's sub-blocks are marked dirty again, so they are
+ *	re-pulled like any other stale sub-block. Without one, the chunk is
+ *	either dirty as a whole and re-pulled anyway, or clean. A clean chunk
+ *	cannot be undone here, since this node may have finished it after
+ *	storing the write, so the write is kept. The check and the update
+ *	share subblk_cache_lock with rmr_subblk_take_if_clean(), so a clean
+ *	verdict cannot erase the slot in between.
+ *
+ * Return:
+ *	true if the chunk is clean here and the write was kept.
+ */
+bool rmr_subblk_undo(struct rmr_dirty_id_map *map, u64 chunk, u32 first,
+		     u32 count)
+{
+	rmr_id_t id = { .a = 1, .b = chunk };
+	struct rmr_subblk_slot *s;
+	unsigned long flags;
+	bool kept = false;
+
+	spin_lock_irqsave(&map->subblk_cache_lock, flags);
+	s = xa_load(&map->subblk_cache, chunk);
+	if (s)
+		rmr_subblk_slot_set_dirty(s, first, count);
+	else
+		kept = !rmr_map_check_dirty(map, id);
+	spin_unlock_irqrestore(&map->subblk_cache_lock, flags);
+
+	return kept;
+}
+
+/**
  * rmr_map_set_dirty -	Set bits from rmr_id_t
  *
  * @map:		Map to work on
@@ -333,10 +668,25 @@ static void rmr_chunk_md_unset_dirty(u8 *chunk_md)
  */
 inline void rmr_map_set_dirty(struct rmr_dirty_id_map *map, rmr_id_t id, u8 filter)
 {
+	unsigned long flags;
 	u8 *chunk_md;
 	u64 i;
 
 	map->ts = jiffies;
+
+	/*
+	 * A slot records which sub-blocks hold the correct local data, which
+	 * stops being true once the chunk is re-dirtied. Drop it and set the
+	 * dirty bit in one subblk_cache_lock section, so that
+	 * rmr_subblk_take_if_clean() cannot clear the bit over this re-dirty.
+	 * A reader that looked the slot up before the drop may still update
+	 * it. That is harmless, because no verdict is taken from a detached
+	 * slot. rmr_subblk_take_if_clean() judges the chunk by the slot the
+	 * cache holds.
+	 */
+	spin_lock_irqsave(&map->subblk_cache_lock, flags);
+	for (i = 0; i < id.a; i++)
+		__rmr_subblk_remove(map, id.b + i);
 
 	chunk_md = rmr_get_chunk_md_from_id(map, id);
 	for (i = 0; i < id.a; i++) {
@@ -348,6 +698,7 @@ inline void rmr_map_set_dirty(struct rmr_dirty_id_map *map, rmr_id_t id, u8 filt
 		rmr_chunk_md_set_dirty(chunk_md);
 		chunk_md++;
 	}
+	spin_unlock_irqrestore(&map->subblk_cache_lock, flags);
 }
 
 inline void rmr_map_set_dirty_all(struct rmr_dirty_id_map *map, u8 filter)
@@ -357,6 +708,13 @@ inline void rmr_map_set_dirty_all(struct rmr_dirty_id_map *map, u8 filter)
 	bool is_last_flp;
 	u8 *slp;
 	int i, j, k;
+
+	/*
+	 * Every cached refinement record is now stale. Drain before setting
+	 * the bitmap, so a sync snapshot or a clean verdict taken after the
+	 * bits are set cannot trust a slot from before this re-dirty.
+	 */
+	rmr_subblk_drain_all(map);
 
 	for (i = 0; i < map->no_of_flp; i++) {
 		flp_ptr = (el_flp *)map->dirty_bitmap[i];
@@ -402,6 +760,7 @@ inline struct rmr_map_entry *rmr_map_unset_dirty(struct rmr_dirty_id_map *map, r
 						 u8 filter)
 {
 	struct rmr_map_entry *entry;
+	unsigned long flags;
 	u8 *chunk_md;
 	u64 i;
 
@@ -419,13 +778,45 @@ inline struct rmr_map_entry *rmr_map_unset_dirty(struct rmr_dirty_id_map *map, r
 		chunk_md++;
 	}
 
-	entry = xa_erase(&map->rmr_id_map, rmr_id_to_key(id));
+	/*
+	 * Drop any cached sub-block refinement for every chunk being
+	 * cleaned. A slot only describes a dirty chunk; once clean, the
+	 * slot would survive into the next dirty cycle and falsely claim
+	 * some sub-blocks are in sync. Centralized here so every caller
+	 * is correct by construction.
+	 */
+	for (i = 0; i < id.a; i++)
+		rmr_subblk_remove(map, id.b + i);
+
+	xa_lock_irqsave(&map->rmr_id_map, flags);
+	entry = __xa_erase(&map->rmr_id_map, rmr_id_to_key(id));
+	xa_unlock_irqrestore(&map->rmr_id_map, flags);
 	if (!entry) {
 		pr_debug("in the member_id %d there is no entry for id [%llu, %llu]\n",
 			 map->member_id, id.a, id.b);
 	}
 
 	return entry;
+}
+
+/**
+ * rmr_map_erase_entry() - drop a chunk's entry and leave its dirty bit alone.
+ *
+ * @map:	map to work on.
+ * @id:		the chunk.
+ *
+ * Description:
+ *	For a caller that took the chunk clean with rmr_subblk_take_if_clean(),
+ *	which already cleared the bit. Clearing it again could erase a re-dirty
+ *	that landed since.
+ */
+void rmr_map_erase_entry(struct rmr_dirty_id_map *map, rmr_id_t id)
+{
+	unsigned long flags;
+
+	xa_lock_irqsave(&map->rmr_id_map, flags);
+	__xa_erase(&map->rmr_id_map, rmr_id_to_key(id));
+	xa_unlock_irqrestore(&map->rmr_id_map, flags);
 }
 
 /*
@@ -448,7 +839,7 @@ inline bool rmr_map_check_dirty(struct rmr_dirty_id_map *map, rmr_id_t id)
 }
 
 /**
- * rmr_map_get_dirty_entry - Check and return entry if the following bits are set
+ * rmr_map_find_dirty_entry - Look up the entry of a dirty chunk
  *
  * @map:		Map to work on
  * @id:			rmr_id_t containing the chunk info
@@ -456,48 +847,126 @@ inline bool rmr_map_check_dirty(struct rmr_dirty_id_map *map, rmr_id_t id)
  *			id.a: Number of chunks dirty starting (and including) id.b
  *
  * Description:
- *	Check if a chunk is dirty or not.
- *	If the particular chunk is dirty, then create an entry for it and return back.
+ *	Pure lookup: does not allocate and leaves the caller's RCU read
+ *	section alone, so a caller may keep other RCU-protected pointers
+ *	live across it. A dirty chunk with no entry yet is reported
+ *	separately, because only rmr_map_create_dirty_entry() can supply one
+ *	and it must run outside the read section.
  *
  * Context:
- *	srcu pool->map_srcu should be held while calling this function.
+ *	Call with rcu_read_lock() held; it keeps the returned entry alive
+ *	against a concurrent call_rcu() free. The caller keeps @map valid,
+ *	since rmr_pool_find_map() returns it unprotected.
+ *
+ * Return:
+ *	the entry when the chunk is dirty and has one;
+ *	NULL when the chunk is clean;
+ *	ERR_PTR(-ENOENT) when the chunk is dirty but has no entry yet.
  */
-inline struct rmr_map_entry *rmr_map_get_dirty_entry(struct rmr_dirty_id_map *map, rmr_id_t id)
+inline struct rmr_map_entry *rmr_map_find_dirty_entry(struct rmr_dirty_id_map *map, rmr_id_t id)
+{
+	struct rmr_map_entry *entry;
+
+	if (!rmr_map_check_dirty(map, id))
+		return NULL;
+
+	entry = xa_load(&map->rmr_id_map, rmr_id_to_key(id));
+	if (!entry) {
+		pr_debug("%s: For id [%llu, %llu], no entry yet, member_id %u\n",
+			 __func__, id.a, id.b, map->member_id);
+		return ERR_PTR(-ENOENT);
+	}
+
+	pr_debug("%s: For id [%llu, %llu], entry exists member_id %u\n",
+		 __func__, id.a, id.b, map->member_id);
+
+	return entry;
+}
+
+/**
+ * rmr_map_create_dirty_entry - Install an entry for a dirty chunk
+ *
+ * @map:		Map to work on
+ * @id:			rmr_id_t containing the chunk info
+ *			id.b: chunk number denoted by this entry
+ *			id.a: Number of chunks dirty starting (and including) id.b
+ *
+ * Description:
+ *	Idempotent: losing the insert race counts as success, since the
+ *	winner's entry is the one every subsequent lookup finds. Does not
+ *	return the entry, because nothing keeps it alive once the caller
+ *	re-enters its read section; the caller re-runs
+ *	rmr_map_find_dirty_entry() for that.
+ *
+ * Context:
+ *	Sleeps. Call without rcu_read_lock() held.
+ *
+ * Return:
+ *	0 once an entry exists for @id, negative errno on allocation failure.
+ */
+int rmr_map_create_dirty_entry(struct rmr_dirty_id_map *map, rmr_id_t id)
 {
 	struct rmr_map_entry *entry;
 	int err;
 
-	if (rmr_map_check_dirty(map, id)) {
-		entry = xa_load(&map->rmr_id_map, rmr_id_to_key(id));
-		if (entry) {
-			pr_debug("%s: For id [%llu, %llu], entry exists member_id %u\n",
-				 __func__, id.a, id.b, map->member_id);
-			return entry;
-		}
-
-		entry = kmem_cache_zalloc(rmr_map_entry_cachep, GFP_KERNEL);
-		if (!entry) {
-			pr_err("%s: Cannot allocate entry for member_id %d, id [[%llu, %llu]]\n",
-			       __func__, map->member_id, id.a, id.b);
-			return ERR_PTR(-ENOMEM);
-		}
-
-		atomic_set(&entry->sync_cnt, -1);
-		init_llist_head(&entry->wait_list);
-
-		err = xa_insert(&map->rmr_id_map, rmr_id_to_key(id), entry, GFP_KERNEL);
-		if (err == 0)
-			return entry;
-
-		kmem_cache_free(rmr_map_entry_cachep, entry);
-
-		if (err == -EBUSY)
-			return xa_load(&map->rmr_id_map, rmr_id_to_key(id));
-		else
-			return ERR_PTR(-ENOMEM);
+	entry = kmem_cache_zalloc(rmr_map_entry_cachep, GFP_KERNEL);
+	if (!entry) {
+		pr_err("%s: Cannot allocate entry for member_id %d, id [[%llu, %llu]]\n",
+		       __func__, map->member_id, id.a, id.b);
+		return -ENOMEM;
 	}
 
-	return NULL;
+	atomic_set(&entry->sync_cnt, -1);
+	init_llist_head(&entry->wait_list);
+
+	err = xa_insert_irq(&map->rmr_id_map, rmr_id_to_key(id), entry, GFP_KERNEL);
+	if (err)
+		kmem_cache_free(rmr_map_entry_cachep, entry);
+
+	/* Losing the race to another caller still leaves an entry for @id. */
+	return err == -EBUSY ? 0 : err;
+}
+
+/**
+ * rmr_map_get_dirty_entry_rcu - Look up the entry of a dirty chunk, creating it if missing
+ *
+ * @map:		Map to work on
+ * @id:			rmr_id_t containing the chunk info
+ *			id.b: chunk number denoted by this entry
+ *			id.a: Number of chunks dirty starting (and including) id.b
+ *
+ * Description:
+ *	Creating an entry sleeps, so on a miss the read section is left for
+ *	rmr_map_create_dirty_entry() and the lookup is redone once it is
+ *	retaken. Nothing found before the gap is carried across it. Another
+ *	pass is only needed if the chunk was cleaned and re-dirtied
+ *	meanwhile, which is progress elsewhere rather than a spin.
+ *
+ * Context:
+ *	Call with rcu_read_lock() held; it may be dropped and retaken, so the
+ *	caller must not hold other RCU-protected pointers across this call.
+ *	Returns with rcu_read_lock() held. The caller keeps @map valid, since
+ *	rmr_pool_find_map() returns it unprotected.
+ *
+ * Return:
+ *	the entry when the chunk is dirty, valid for the caller's read section;
+ *	NULL when the chunk is clean;
+ *	ERR_PTR() on allocation failure.
+ */
+struct rmr_map_entry *rmr_map_get_dirty_entry_rcu(struct rmr_dirty_id_map *map, rmr_id_t id)
+{
+	struct rmr_map_entry *entry;
+	int err;
+
+	while (IS_ERR(entry = rmr_map_find_dirty_entry(map, id))) {
+		rcu_read_unlock();
+		err = rmr_map_create_dirty_entry(map, id);
+		rcu_read_lock();
+		if (err)
+			return ERR_PTR(err);
+	}
+
+	return entry;
 }
 
 /**
@@ -561,6 +1030,9 @@ inline void rmr_map_unset_dirty_all(struct rmr_dirty_id_map *map)
 	 * erased each entry from the xarray without freeing it.
 	 */
 	xa_destroy(&map->rmr_id_map);
+
+	/* Every chunk is now clean; any cached refinement state is stale. */
+	rmr_subblk_drain_all(map);
 
 	rmr_map_clear_filter_all(map, MAP_ENTRY_UNSYNCED);
 }
@@ -653,7 +1125,7 @@ inline int rmr_map_create_entries(struct rmr_dirty_id_map *map)
 		pr_debug("%s: Adding entry %p for chunk %llu\n",
 			 __func__, entry, i);
 
-		err = xa_insert(&map->rmr_id_map, rmr_id_to_key(id), entry, GFP_KERNEL);
+		err = xa_insert_irq(&map->rmr_id_map, rmr_id_to_key(id), entry, GFP_KERNEL);
 		if (err) {
 			pr_err("%s: Cannot insert entry for member_id %d, chunk %llu\n",
 			       __func__, map->member_id, i);

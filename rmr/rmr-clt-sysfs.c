@@ -25,8 +25,6 @@
  */
 #define RTRS_RECONNECT_BACKOFF 1000
 
-#define RMR_DEFAULT_CHUNK_SIZE 131072 /* 128 KB */
-
 static struct class *rmr_dev_class;
 static struct device *rmr_ctl_dev;
 static struct device *rmr_pool_dev;
@@ -346,9 +344,10 @@ static ssize_t rmr_clt_del_sess_store(struct kobject *kobj,
 		rmr_clt_pool_io_freeze(clt_pool);
 
 		/*
-		 * Wait for all completion
+		 * Wait for all completion (unbounded: del_sess must not erase a
+		 * member while IO to it is still in flight).
 		 */
-		rmr_clt_pool_io_wait_complete(clt_pool);
+		rmr_clt_pool_io_wait_complete(clt_pool, 0);
 
 		/*
 		 * Remove the storage node from the pool members list.
@@ -610,9 +609,11 @@ static int rmr_clt_create_session_sysfs_files(struct rmr_clt_pool_sess *pool_ses
 	ret = kobject_init_and_add(&pool_sess->kobj, &rmr_clt_pool_sess_ktype,
 				   &pool_sess->pool->sessions_kobj,
 				   "%s", pool_sess->sessname);
-	if (ret)
+	if (ret) {
 		pr_err("Failed to create sysfs dir for session '%s': %d\n",
 		       pool_sess->sessname, ret);
+		kobject_put(&pool_sess->kobj);
+	}
 
 	return ret;
 }
@@ -989,7 +990,7 @@ static int rmr_clt_create_pool_sysfs_files(struct rmr_pool *pool)
 	if (ret) {
 		pr_err("Failed to create sysfs dir for pool '%s': %d\n",
 		       pool->poolname, ret);
-		return ret;
+		goto put_pool_kobj;
 	}
 
 	ret = kobject_init_and_add(&pool->sessions_kobj, &ktype, &pool->kobj,
@@ -997,7 +998,7 @@ static int rmr_clt_create_pool_sysfs_files(struct rmr_pool *pool)
 	if (unlikely(ret)) {
 		pr_err("Failed to create sessions dir for pool '%s': %d\n",
 		       pool->poolname, ret);
-		goto put_pool_kobj;
+		goto put_sessions_kobj;
 	}
 	clt_pool = (struct rmr_clt_pool *)pool->priv;
 	ret = rmr_clt_create_stats_files(&pool->kobj, &clt_pool->stats_kobj);
@@ -1005,16 +1006,17 @@ static int rmr_clt_create_pool_sysfs_files(struct rmr_pool *pool)
 		pr_err("Failed to create sysfs stats files "
 		       "for pool '%s': %d\n",
 		       pool->poolname, ret);
-		goto put_sessions_kobj;
+		goto del_sessions_kobj;
 	}
 
 	return 0;
 
-put_sessions_kobj:
+del_sessions_kobj:
 	kobject_del(&pool->sessions_kobj);
+put_sessions_kobj:
 	kobject_put(&pool->sessions_kobj);
-put_pool_kobj:
 	kobject_del(&pool->kobj);
+put_pool_kobj:
 	kobject_put(&pool->kobj);
 
 	return ret;
@@ -1162,6 +1164,7 @@ int rmr_clt_create_clt_sess_sysfs_files(struct rmr_clt_sess *clt_sess)
 	if (ret) {
 		pr_err("Failed to create sysfs dir for sess '%s': %d\n",
 		       clt_sess->sessname, ret);
+		kobject_put(&clt_sess->kobj);
 		return ret;
 	}
 
@@ -1191,9 +1194,8 @@ static int rmr_clt_parse_join_opts(const char *buf, char *poolname,
 	if (!options)
 		return -ENOMEM;
 
-	options = strstrip(options);
-	strip(options);
-	sep_opt = options;
+	sep_opt = strstrip(options);
+	strip(sep_opt);
 	while ((p = strsep(&sep_opt, " ")) != NULL) {
 		if (!*p)
 			continue;
@@ -1208,9 +1210,8 @@ static int rmr_clt_parse_join_opts(const char *buf, char *poolname,
 				ret = -ENOMEM;
 				goto out;
 			}
-			if (strlen(p) > NAME_MAX) {
-				pr_err("join_pool: poolname too long\n");
-				ret = -EINVAL;
+			ret = rmr_check_poolname(p);
+			if (ret) {
 				kfree(p);
 				goto out;
 			}
@@ -1476,20 +1477,21 @@ static int rmr_clt_create_stats_files(struct kobject *kobj,
 	if (ret) {
 		pr_err("Failed to init and add stats kobject, err: %d\n",
 		       ret);
-		return ret;
+		goto put_stats_obj;
 	}
 
 	ret = sysfs_create_group(stats_kobj, &rmr_clt_stats_attr_group);
 	if (ret) {
 		pr_err("failed to create stats sysfs group, err: %d\n",
 		       ret);
-		goto put_stats_obj;
+		goto del_stats_obj;
 	}
 
 	return 0;
 
-put_stats_obj:
+del_stats_obj:
 	kobject_del(stats_kobj);
+put_stats_obj:
 	kobject_put(stats_kobj);
 
 	return ret;

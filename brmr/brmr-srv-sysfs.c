@@ -341,9 +341,11 @@ static int blk_str_create_sysfs_files(struct brmr_srv_blk_dev *dev)
 	ret = kobject_init_and_add(&dev->kobj, &blk_str_device_ktype,
 				   &rmr_strs_dev->kobj,
 				   "%s", dev->poolname);
-	if (ret)
+	if (ret) {
 		pr_err("Failed to create sysfs dir for store %s, name %s, err=%d\n",
 		       dev->name, dev->poolname, ret);
+		kobject_put(&dev->kobj);
+	}
 
 	return ret;
 }

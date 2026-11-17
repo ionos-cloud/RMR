@@ -9,7 +9,7 @@
 #define RMR_PROTO_H
 
 #define RMR_PROTO_VER_MAJOR 0
-#define RMR_PROTO_VER_MINOR 1
+#define RMR_PROTO_VER_MINOR 2
 
 #define RMR_PROTO_VER_STRING __stringify(RMR_PROTO_VER_MAJOR) "." \
 			       __stringify(RMR_PROTO_VER_MINOR)
@@ -23,6 +23,21 @@
 #define RTRS_PORT 1234
 
 #define RMR_POOL_MAX_SESS 4
+
+/*
+ * The MAP_ADD reply to an undo. The client asks for an undo when a leg of a
+ * write failed and no node that stored the write holds its whole chunk, so
+ * the write must not be acked. Distinct from the errors that mean the session
+ * itself is unusable, because the client tears a session down on those and a
+ * data-path verdict must not cost a healthy replica leg.
+ */
+#define RMR_ERR_NO_COMPLETE_COPY	(-ENODATA)
+
+/*
+ * Write reply: stored, but the node is still behind on the chunk, so it holds
+ * the write without the whole chunk. The client counts the leg as a success.
+ */
+#define RMR_IO_OK_PARTIAL		(-EUCLEAN)
 
 /**
  * enum rmr_msg_types - RMR message types
@@ -77,7 +92,8 @@ struct rmr_msg_io {
 
 	u8		member_id;
 	u8		sync;
-	u8		__padding[15];
+	u8		undo_write; /* MAP_ADD: an undo, not a mark behind */
+	u8		__padding[14];
 };
 
 struct rmr_pool_member_info {

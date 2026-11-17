@@ -99,7 +99,32 @@ struct rmr_pool {
 
 	bool is_clt;
 	bool sync;
+
+	/*
+	 * Per-map sub-block slot cache cap in KiB, applied to every
+	 * map of this pool.
+	 */
+	u32			subblk_cache_kb;
+	/* @subblk_cache_kb as a slot count; see rmr_subblk_kb_to_slots(). */
+	u32			subblk_slots_max;
 };
+
+#define RMR_MAPCLEAR_FIFO_SIZE		1024	/* u64 chunk ids; power of 2 */
+
+#define RMR_SUBBLK_CACHE_KB_DEFAULT	16384	/* 16 MiB of slots per map */
+
+/*
+ * A cap of 0 is not "disabled": it would refuse every slot, so no chunk could
+ * ever hold a refinement and every covering write would fall back to
+ * park-and-converge. Keep at least one slot's worth.
+ *
+ * The cap is per map, and only the node's own map gets slots, so at the
+ * maximum a pool holds 1 GiB of slots, in unreclaimable GFP_NOWAIT slab. The
+ * top end is there to catch a mistyped value, not to size the node's
+ * footprint.
+ */
+#define RMR_SUBBLK_CACHE_KB_MIN		1
+#define RMR_SUBBLK_CACHE_KB_MAX		BIT(20)	/* 1 GiB of slots per map */
 
 /**
  * rmr_pool_find_md - find the index of the srv_md with the provided key in the pool_md
@@ -237,6 +262,7 @@ extern struct mutex pool_mutex;
 
 const char *rmr_get_cmd_name(enum rmr_msg_cmd_type cmd);
 
+int rmr_check_poolname(const char *poolname);
 struct rmr_pool *rmr_create_pool(const char *poolname, void *priv);
 void free_pool(struct rmr_pool *pool);
 

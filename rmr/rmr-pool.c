@@ -8,6 +8,7 @@
 #include <linux/wait.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
+#include <linux/ctype.h>
 
 #include "rmr-pool.h"
 
@@ -170,6 +171,8 @@ static struct rmr_pool *alloc_pool(const char *poolname, u32 group_id)
 	pool->group_id = group_id;
 	pool->map_ver = 1;
 	pool->mapped_size = 0;
+	pool->subblk_cache_kb = RMR_SUBBLK_CACHE_KB_DEFAULT;
+	pool->subblk_slots_max = rmr_subblk_kb_to_slots(pool->subblk_cache_kb);
 	xa_init_flags(&pool->stg_members, XA_FLAGS_ALLOC);
 	init_completion(&pool->complete_done);
 	init_completion(&pool->confirm_done);
@@ -193,6 +196,42 @@ cleanup_sess_srcu:
 free_pool:
 	kfree(pool);
 	return pool;
+}
+
+/*
+ * A poolname becomes a sysfs directory name and a workqueue name, and is
+ * carried over the wire, so restrict it to a portable filename character
+ * set: alphanumerics plus '-' and '_'.  '.' is left out so that "." and
+ * ".." cannot be built at all, the same way rtrs rejects '.' in a path
+ * name.
+ */
+int rmr_check_poolname(const char *poolname)
+{
+	size_t len = strlen(poolname);
+	size_t i;
+
+	if (!len) {
+		pr_err("poolname must not be empty\n");
+		return -EINVAL;
+	}
+
+	if (len >= NAME_MAX) {
+		pr_err("poolname is too long, max %d characters\n", NAME_MAX - 1);
+		return -EINVAL;
+	}
+
+	for (i = 0; i < len; i++) {
+		char c = poolname[i];
+
+		if (isalnum(c) || c == '-' || c == '_')
+			continue;
+
+		pr_err("poolname has an invalid character at position %zu, allowed are [A-Za-z0-9_-]\n",
+		       i);
+		return -EINVAL;
+	}
+
+	return 0;
 }
 
 struct rmr_pool *rmr_create_pool(const char *poolname, void *priv)
@@ -384,6 +423,19 @@ int rmr_pool_save_map(struct rmr_pool *pool, void *buf, size_t buflen,
 	WARN_ON(buf_size % PAGE_SIZE);
 
 	pr_info("%s: buf_size %u, buflen w/o hdr %lu\n", __func__, map_buf_hdr->buf_size, buflen);
+
+	/*
+	 * A non-test save overwrites the dirty bitmap with a peer's
+	 * view. Any cached sub-block refinement is now invalid because
+	 * slots from before the gap cannot claim sub-blocks are clean
+	 * against post-gap peer state. Drain before the overwrite, not
+	 * after, so a sync snapshot or a clean verdict taken against the
+	 * new bitmap cannot trust a stale slot's in-sync bits. A chunk
+	 * without a slot is synced whole until a fast-path write gives it
+	 * a new one.
+	 */
+	if (!test_only)
+		rmr_subblk_drain_all(map);
 
 	/*
 	 * The buf_size would be a factor of PAGE_SIZE,

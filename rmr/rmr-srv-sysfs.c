@@ -36,9 +36,11 @@ int rmr_srv_sysfs_add_sess(struct rmr_pool *pool,
 	ret = kobject_init_and_add(&pool_sess->kobj, &rmr_srv_sess_ktype,
 				   &pool->sessions_kobj, "%s",
 				   pool_sess->sessname);
-	if (ret)
+	if (ret) {
 		pr_err("Failed to add session %s into sysfs\n",
 		       pool_sess->sessname);
+		kobject_put(&pool_sess->kobj);
+	}
 
 	return ret;
 }
@@ -320,6 +322,8 @@ static ssize_t rmr_srv_add_clt_pool_store(struct kobject *kobj,
 
 close_clt:
 	srv_pool->clt = NULL;
+	/* A map-clear worker that already read the pointer may still use it. */
+	flush_work(&srv_pool->mapclear_work);
 	srv_pool->max_sync_io_size = 0;
 close_rmr:
 	pr_err("%s: Adding client pool failed\n", __func__);
@@ -758,6 +762,102 @@ static ssize_t map_summary_show(struct kobject *kobj,
 static struct kobj_attribute rmr_srv_pool_map_summary_attr =
 	__ATTR_RO(map_summary);
 
+static ssize_t subblk_cache_kb_show(struct kobject *kobj,
+				    struct kobj_attribute *attr,
+				    char *page)
+{
+	struct rmr_pool *pool = container_of(kobj, struct rmr_pool, kobj);
+
+	return sysfs_emit(page, "%u\n", READ_ONCE(pool->subblk_cache_kb));
+}
+
+/* Pairs subblk_cache_kb with the slot count derived from it across writers. */
+static DEFINE_MUTEX(subblk_cache_kb_lock);
+
+static ssize_t subblk_cache_kb_store(struct kobject *kobj,
+				     struct kobj_attribute *attr,
+				     const char *buf, size_t count)
+{
+	struct rmr_pool *pool = container_of(kobj, struct rmr_pool, kobj);
+	u32 val;
+	int err;
+
+	err = kstrtou32(buf, 0, &val);
+	if (err)
+		return err;
+
+	if (val < RMR_SUBBLK_CACHE_KB_MIN || val > RMR_SUBBLK_CACHE_KB_MAX)
+		return -EINVAL;
+
+	/*
+	 * The KiB value is what the user reads back; the slot count derived
+	 * from it is what admission compares against. Both are updated here
+	 * so a write takes effect without the IO path recomputing a budget,
+	 * and under the mutex so two concurrent writes cannot leave one
+	 * write's value with the other's count.
+	 */
+	mutex_lock(&subblk_cache_kb_lock);
+	WRITE_ONCE(pool->subblk_cache_kb, val);
+	WRITE_ONCE(pool->subblk_slots_max, rmr_subblk_kb_to_slots(val));
+	mutex_unlock(&subblk_cache_kb_lock);
+
+	return count;
+}
+
+static struct kobj_attribute rmr_srv_pool_subblk_cache_kb_attr =
+	__ATTR_RW(subblk_cache_kb);
+
+/*
+ * One line per cached sub-block slot, so the sub-block state of a PARTIAL
+ * chunk is observable:
+ *
+ *	<member_id> <chunk> <nr_dirty> <nr_subblk>
+ *
+ * A chunk with no line either holds no dirty data at all or is tracked at
+ * chunk granularity only (FULLY_DIRTY). Output is truncated with a trailing
+ * "..." line if the cache does not fit in one page.
+ */
+static ssize_t subblk_map_show(struct kobject *kobj,
+			       struct kobj_attribute *attr,
+			       char *page)
+{
+	struct rmr_pool *pool = container_of(kobj, struct rmr_pool, kobj);
+	struct rmr_dirty_id_map *map;
+	struct rmr_subblk_slot *s;
+	unsigned long chunk;
+	int i, lock_idx;
+	ssize_t len = 0;
+
+	lock_idx = srcu_read_lock(&pool->map_srcu);
+	for (i = 0; i < RMR_POOL_MAX_SESS; i++) {
+		map = rcu_dereference(pool->maps[i]);
+		if (!map)
+			continue;
+
+		rcu_read_lock();
+		xa_for_each(&map->subblk_cache, chunk, s) {
+			if (len > PAGE_SIZE - 64) {
+				len += sysfs_emit_at(page, len, "...\n");
+				rcu_read_unlock();
+				goto out;
+			}
+
+			len += sysfs_emit_at(page, len, "%u %lu %u %u\n",
+					     map->member_id, chunk,
+					     rmr_subblk_slot_nr_dirty(s),
+					     s->nr_subblk);
+		}
+		rcu_read_unlock();
+	}
+out:
+	srcu_read_unlock(&pool->map_srcu, lock_idx);
+
+	return len;
+}
+
+static struct kobj_attribute rmr_srv_pool_subblk_map_attr =
+	__ATTR_RO(subblk_map);
+
 static struct attribute *rmr_srv_pool_attrs[] = {
 	&rmr_srv_leave_pool_attr.attr,
 	&rmr_srv_member_id_attr.attr,
@@ -775,6 +875,8 @@ static struct attribute *rmr_srv_pool_attrs[] = {
 	&rmr_srv_pool_map_update_state_attr.attr,
 	&rmr_srv_pool_map_unsynced_attr.attr,
 	&rmr_srv_pool_map_summary_attr.attr,
+	&rmr_srv_pool_subblk_cache_kb_attr.attr,
+	&rmr_srv_pool_subblk_map_attr.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(rmr_srv_pool);
@@ -797,7 +899,7 @@ static int rmr_srv_create_pool_sysfs_files(struct rmr_pool *pool)
 	if (ret) {
 		pr_err("Failed to create sysfs dir for pool '%s': %d\n",
 		       pool->poolname, ret);
-		return ret;
+		goto put_pool_kobj;
 	}
 
 	ret = kobject_init_and_add(&pool->sessions_kobj, &ktype, &pool->kobj,
@@ -805,9 +907,16 @@ static int rmr_srv_create_pool_sysfs_files(struct rmr_pool *pool)
 	if (unlikely(ret)) {
 		pr_err("Failed to create sessions dir for pool '%s': %d\n",
 		       pool->poolname, ret);
-		kobject_del(&pool->kobj);
-		kobject_put(&pool->kobj);
+		goto put_sessions_kobj;
 	}
+
+	return 0;
+
+put_sessions_kobj:
+	kobject_put(&pool->sessions_kobj);
+	kobject_del(&pool->kobj);
+put_pool_kobj:
+	kobject_put(&pool->kobj);
 
 	return ret;
 }
@@ -847,7 +956,7 @@ static const match_table_t rmr_srv_opt_tokens = {
 static int rmr_srv_parse_options(const char *buf, char *poolname,
 				 u32 *member_id)
 {
-	char *options, *p;
+	char *options, *sep_opt, *p;
 	substring_t args[MAX_OPT_ARGS];
 	int opt_mask = 0;
 	int token, ret = 0, i;
@@ -856,9 +965,9 @@ static int rmr_srv_parse_options(const char *buf, char *poolname,
 	if (!options)
 		return -ENOMEM;
 
-	options = strstrip(options);
-	strip(options);
-	while ((p = strsep(&options, " ")) != NULL) {
+	sep_opt = strstrip(options);
+	strip(sep_opt);
+	while ((p = strsep(&sep_opt, " ")) != NULL) {
 		if (!*p)
 			continue;
 		token = match_token(p, rmr_srv_opt_tokens, args);
@@ -871,9 +980,8 @@ static int rmr_srv_parse_options(const char *buf, char *poolname,
 				ret = -ENOMEM;
 				goto out;
 			}
-			if (strlen(p) > NAME_MAX) {
-				pr_err("join_pool: name too long\n");
-				ret = -EINVAL;
+			ret = rmr_check_poolname(p);
+			if (ret) {
 				kfree(p);
 				goto out;
 			}
